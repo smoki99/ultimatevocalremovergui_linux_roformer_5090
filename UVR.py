@@ -41,15 +41,21 @@ from gui_data.error_handling import error_text, error_dialouge
 from gui_data.old_data_check import file_check, remove_unneeded_yamls, remove_temps
 from gui_data.tkinterdnd2 import TkinterDnD, DND_FILES
 from lib_v5.vr_network.model_param_init import ModelParameters
-from kthread import KThread
 from lib_v5 import spec_utils
+from lib_v5 import apollo_inference
+from kthread import KThread
 from pathlib  import Path
 from separate import (
     SeperateDemucs, SeperateMDX, SeperateMDXC, SeperateVR,  # Model-related
     save_format, clear_gpu_cache,  # Utility functions
-    cuda_available, mps_available, #directml_available,
+    cuda_available, directml_available, mps_available
 )
-from playsound import playsound
+# Playsound is incompatible with Python 3.12, using dummy function
+try:
+    from playsound import playsound
+except (ImportError, OSError):
+    def playsound(sound):
+        pass  # Dummy function - sound notifications disabled
 from typing import List
 import onnx
 import re
@@ -57,15 +63,21 @@ import sys
 import yaml
 from ml_collections import ConfigDict
 from collections import Counter
+from os.path import expanduser
+# import faulthandler
+# faulthandler.enable()
 
-# if not is_macos:
-#     import torch_directml
+# DirectML is Windows-only
+if not is_macos and sys.platform == "win32":
+    try:
+        import torch_directml # type:ignore
+    except ImportError:
+        pass  # DirectML not available on Linux
 
-# is_choose_arch = cuda_available and directml_available
-# is_opencl_only = not cuda_available and directml_available
-# is_cuda_only = cuda_available and not directml_available
-
-is_gpu_available = cuda_available or mps_available# or directml_available
+is_choose_arch = cuda_available and directml_available
+is_directml_only = not cuda_available and directml_available
+is_cuda_only = cuda_available and not directml_available
+is_gpu_available = cuda_available or directml_available or mps_available
 
 # Change the current working directory to the directory
 # this file sits in
@@ -212,6 +224,21 @@ def font_checker(font_file):
     chosen_font = chosen_font_name, chosen_font_file
      
     return chosen_font
+
+def get_yaml_data(yamml_path, is_get_dict=False):
+    config = None
+    try:
+        if os.path.isfile(yamml_path):
+            with open(yamml_path) as f:
+                config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+                
+            if is_get_dict:
+                config = dict(config)
+                
+    except Exception as e:
+        print(e)
+        
+    return config
         
 debugger = []
 
@@ -223,12 +250,16 @@ MDX_MODELS_DIR = os.path.join(MODELS_DIR, 'MDX_Net_Models')
 DEMUCS_MODELS_DIR = os.path.join(MODELS_DIR, 'Demucs_Models')
 DEMUCS_NEWER_REPO_DIR = os.path.join(DEMUCS_MODELS_DIR, 'v3_v4_repo')
 MDX_MIXER_PATH = os.path.join(BASE_PATH, 'lib_v5', 'mixer.ckpt')
+APOLLO_MODELS_DIR = os.path.join(MODELS_DIR, 'Apollo_Models')
+APOLLO_CONFIG_PATH = os.path.join(APOLLO_MODELS_DIR, 'model_configs')
 
 #Cache & Parameters
 VR_HASH_DIR = os.path.join(VR_MODELS_DIR, 'model_data')
 VR_HASH_JSON = os.path.join(VR_MODELS_DIR, 'model_data', 'model_data.json')
 MDX_HASH_DIR = os.path.join(MDX_MODELS_DIR, 'model_data')
 MDX_HASH_JSON = os.path.join(MDX_HASH_DIR, 'model_data.json')
+APOLLO_HASH_DIR = os.path.join(APOLLO_MODELS_DIR, 'model_data')
+APOLLO_HASH_JSON = os.path.join(APOLLO_HASH_DIR, 'model_data.json')
 MDX_C_CONFIG_PATH = os.path.join(MDX_HASH_DIR, 'mdx_c_configs')
 
 DEMUCS_MODEL_NAME_SELECT = os.path.join(DEMUCS_MODELS_DIR, 'model_data', 'model_name_mapper.json')
@@ -238,7 +269,13 @@ SETTINGS_CACHE_DIR = os.path.join(BASE_PATH, 'gui_data', 'saved_settings')
 VR_PARAM_DIR = os.path.join(BASE_PATH, 'lib_v5', 'vr_network', 'modelparams')
 SAMPLE_CLIP_PATH = os.path.join(BASE_PATH, 'temp_sample_clips')
 ENSEMBLE_TEMP_PATH = os.path.join(BASE_PATH, 'ensemble_temps')
-DOWNLOAD_MODEL_CACHE = os.path.join(BASE_PATH, 'gui_data', 'model_manual_download.json')
+DOWNLOAD_MODEL_CACHE = os.path.join(BASE_PATH, 'gui_data', 'model_manual_download.json')#
+
+APP_DIR_DATA = os.path.join(expanduser("~"), "UVR Conversions")
+DEFAULT_SAVE_PATH = os.path.join(APP_DIR_DATA)
+
+if not os.path.isdir(DEFAULT_SAVE_PATH):
+    os.mkdir(DEFAULT_SAVE_PATH)
 
 #CR Text
 CR_TEXT = os.path.join(BASE_PATH, 'gui_data', 'cr_text.txt')
@@ -296,7 +333,15 @@ def drop(event, accept_mode: str = 'files'):
                                     title=INVALID_FOLDER_ERROR_TEXT[0],
                                     message=INVALID_FOLDER_ERROR_TEXT[1])
             return
+        
+        if not can_write_to_directory(path):
+            messagebox.showerror(parent=root,
+                                    title=INVALID_FOLDER_ERROR_UNWRITABLE_TEXT[0],
+                                    message=INVALID_FOLDER_ERROR_UNWRITABLE_TEXT[1])
+            return
+        
         root.export_path_var.set(path)
+        root.last_export_path_var.set(path)
     elif accept_mode in ['files', FILE_1, FILE_2, FILE_1_LB, FILE_2_LB]:
         path = path.replace("{", "").replace("}", "")
         for dnd_file in dnd_path_check:
@@ -308,6 +353,7 @@ def drop(event, accept_mode: str = 'files'):
             root.inputPaths = tuple(path)
             root.process_input_selections()
             root.update_inputPaths()
+            root.switch_export_dir()
         elif accept_mode in [FILE_1, FILE_2]:
             if len(path) == 2:
                 root.select_audiofile(path[0])
@@ -346,7 +392,7 @@ class ModelData():
         self.is_denoise_model = True if root.denoise_option_var.get() == DENOISE_M and os.path.isfile(DENOISER_MODEL_PATH) else False
         self.is_gpu_conversion = 0 if root.is_gpu_conversion_var.get() else -1
         self.is_normalization = root.is_normalization_var.get()#
-        self.is_use_opencl = False#True if is_opencl_only else root.is_use_opencl_var.get()
+        self.is_use_directml = True if is_directml_only else root.is_use_directml_var.get()
         self.is_primary_stem_only = root.is_primary_stem_only_var.get()
         self.is_secondary_stem_only = root.is_secondary_stem_only_var.get()
         self.is_denoise = True if not root.denoise_option_var.get() == DENOISE_NONE else False
@@ -431,6 +477,8 @@ class ModelData():
         self.is_save_inst_vocal_splitter = root.is_save_inst_set_vocal_splitter_var.get()
         self.is_inst_only_voc_splitter = root.check_only_selection_stem(INST_STEM_ONLY)
         self.is_save_vocal_only = root.check_only_selection_stem(IS_SAVE_VOC_ONLY)
+        self.is_roformer = False
+        self.is_target_instrument = False
 
         if selected_process_method == ENSEMBLE_MODE:
             self.process_method, _, self.model_name = model_name.partition(ENSEMBLE_PARTITION)
@@ -462,6 +510,7 @@ class ModelData():
             self.model_path = os.path.join(VR_MODELS_DIR, f"{self.model_name}.pth")
             self.get_model_hash()
             if self.model_hash:
+                print(self.model_hash)
                 self.model_hash_dir = os.path.join(VR_HASH_DIR, f"{self.model_hash}.json")
                 if is_change_def:
                     self.model_data = self.change_model_data()
@@ -489,6 +538,7 @@ class ModelData():
             self.mdx_segment_size = int(root.mdx_segment_size_var.get())
             self.get_mdx_model_path()
             self.get_model_hash()
+            print(self.model_hash)
             if self.model_hash:
                 self.model_hash_dir = os.path.join(MDX_HASH_DIR, f"{self.model_hash}.json")
                 if is_change_def:
@@ -497,20 +547,32 @@ class ModelData():
                     self.model_data = self.get_model_data(MDX_HASH_DIR, root.mdx_hash_MAPPER)
                 if self.model_data:
                     
+                    if "is_roformer" in self.model_data:
+                        self.is_roformer = self.model_data["is_roformer"]
+                    
                     if "config_yaml" in self.model_data:
                         self.is_mdx_c = True
                         config_path = os.path.join(MDX_C_CONFIG_PATH, self.model_data["config_yaml"])
-                        if os.path.isfile(config_path):
-                            with open(config_path) as f:
-                                config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
-
+                        config = get_yaml_data(config_path)
+                        
+                        if config:
                             self.mdx_c_configs = config
                                 
                             if self.mdx_c_configs.training.target_instrument:
+                                self.is_target_instrument = True
                                 # Use target_instrument as the primary stem and set 4-stem ensemble to False
                                 target = self.mdx_c_configs.training.target_instrument
                                 self.mdx_model_stems = [target]
                                 self.primary_stem = target
+                                
+                                if self.is_roformer and self.mdx_c_configs.training.target_instrument == VOCAL_STEM and self.is_ensemble_mode:
+                                    self.mdxnet_stem_select = self.ensemble_primary_stem
+                                    
+                                if self.is_roformer and self.mdx_c_configs.training.target_instrument == INST_STEM and self.is_ensemble_mode:
+                                    self.mdxnet_stem_select = self.ensemble_primary_stem
+                                
+                                #print("self.primary_stem target", self.primary_stem)
+
                             else:
                                 # If no specific target_instrument, use all instruments in the training config
                                 self.mdx_model_stems = self.mdx_c_configs.training.instruments
@@ -536,9 +598,13 @@ class ModelData():
                         self.primary_stem_native = self.model_data["primary_stem"]
                         self.check_if_karaokee_model()
                         
+
+                    #print("self.primary_stem final", self.primary_stem)
                     self.secondary_stem = secondary_stem(self.primary_stem)
                 else:
                     self.model_status = False
+                    
+                #print("self.mdxnet_stem_select", self.mdxnet_stem_select)
 
         if self.process_method == DEMUCS_ARCH_TYPE:
             self.is_secondary_model_activated = root.demucs_is_secondary_model_activate_var.get() if not is_secondary_model else False
@@ -746,18 +812,18 @@ class ModelData():
         #print(self.model_name," - ", self.model_hash)
 
 class Ensembler():
-    def __init__(self, is_manual_ensemble=False):
+    def __init__(self, is_manual_ensemble=False, is_save_input_dir=False):
         self.is_save_all_outputs_ensemble = root.is_save_all_outputs_ensemble_var.get()
-        chosen_ensemble_name = '{}'.format(root.chosen_ensemble_var.get().replace(" ", "_")) if not root.chosen_ensemble_var.get() == CHOOSE_ENSEMBLE_OPTION else 'Ensembled'
+        self.chosen_ensemble_name = '{}'.format(root.chosen_ensemble_var.get().replace(" ", "_")) if not root.chosen_ensemble_var.get() == CHOOSE_ENSEMBLE_OPTION else 'Ensembled'
         ensemble_algorithm = root.ensemble_type_var.get().partition("/")
         ensemble_main_stem_pair = root.ensemble_main_stem_var.get().partition("/")
-        time_stamp = round(time.time())
+        self.time_stamp = round(time.time())
         self.audio_tool = MANUAL_ENSEMBLE
         self.main_export_path = Path(root.export_path_var.get())
-        self.chosen_ensemble = f"_{chosen_ensemble_name}" if root.is_append_ensemble_name_var.get() else ''
+        self.chosen_ensemble = f"_{self.chosen_ensemble_name}" if root.is_append_ensemble_name_var.get() else ''
         ensemble_folder_name = self.main_export_path if self.is_save_all_outputs_ensemble else ENSEMBLE_TEMP_PATH
-        self.ensemble_folder_name = os.path.join(ensemble_folder_name, '{}_Outputs_{}'.format(chosen_ensemble_name, time_stamp))
-        self.is_testing_audio = f"{time_stamp}_" if root.is_testing_audio_var.get() else ''
+        self.ensemble_folder_name = os.path.join(ensemble_folder_name, '{}_Outputs_{}'.format(self.chosen_ensemble_name, self.time_stamp))
+        self.is_testing_audio = f"{self.time_stamp}_" if root.is_testing_audio_var.get() else ''
         self.primary_algorithm = ensemble_algorithm[0]
         self.secondary_algorithm = ensemble_algorithm[2]
         self.ensemble_primary_stem = ensemble_main_stem_pair[0]
@@ -767,8 +833,21 @@ class Ensembler():
         self.wav_type_set = root.wav_type_set
         self.mp3_bit_set = root.mp3_bit_set_var.get()
         self.save_format = root.save_format_var.get()
-        if not is_manual_ensemble:
+        self.is_manual_ensemble = is_manual_ensemble
+
+        if not is_manual_ensemble and not is_save_input_dir:
             os.mkdir(self.ensemble_folder_name)
+
+    def save_to_input_dir_ensemble(self, new_path):
+
+        self.main_export_path = Path(new_path)
+        ensemble_folder_name = self.main_export_path if self.is_save_all_outputs_ensemble else ENSEMBLE_TEMP_PATH
+        self.ensemble_folder_name = os.path.join(ensemble_folder_name, '{}_Outputs_{}'.format(self.chosen_ensemble_name, self.time_stamp))
+
+        if not self.is_manual_ensemble and not os.path.isdir(self.ensemble_folder_name):
+            os.mkdir(self.ensemble_folder_name)
+
+        return self.ensemble_folder_name
 
     def ensemble_outputs(self, audio_file_base, export_path, stem, is_4_stem=False, is_inst_mix=False):
         """Processes the given outputs and ensembles them with the chosen algorithm"""
@@ -787,10 +866,11 @@ class Ensembler():
         stem_outputs = self.get_files_to_ensemble(folder=export_path, prefix=audio_file_base, suffix=f"_({stem_tag}).wav")
         audio_file_output = f"{self.is_testing_audio}{audio_file_base}{self.chosen_ensemble}_({stem_tag})"
         stem_save_path = os.path.join('{}'.format(self.main_export_path),'{}.wav'.format(audio_file_output))
-        
-        #print("get_files_to_ensemble: ", stem_outputs)
-        
+
         if len(stem_outputs) > 1:
+            if os.path.isfile(stem_save_path):
+                stem_save_path = stem_save_path.replace(".wav", f"_{self.time_stamp}.wav")
+
             spec_utils.ensemble_inputs(stem_outputs, algorithm, self.is_normalization, self.wav_type_set, stem_save_path, is_wave=self.is_wav_ensemble)
             save_format(stem_save_path, self.save_format, self.mp3_bit_set)
         
@@ -827,6 +907,10 @@ class Ensembler():
         algorithm = root.choose_algorithm_var.get()
         algorithm_text = "" if is_bulk else f"_({root.choose_algorithm_var.get()})"
         stem_save_path = os.path.join('{}'.format(self.main_export_path),'{}{}{}.wav'.format(self.is_testing_audio, audio_file_base, algorithm_text))
+
+        if os.path.isfile(stem_save_path):
+            stem_save_path = stem_save_path.replace(".wav", f"_{self.time_stamp}.wav")
+        
         spec_utils.ensemble_inputs(audio_inputs, algorithm, self.is_normalization, self.wav_type_set, stem_save_path, is_wave=self.is_wav_ensemble)
         save_format(stem_save_path, self.save_format, self.mp3_bit_set)
 
@@ -844,22 +928,42 @@ class Ensembler():
 
 class AudioTools():
     def __init__(self, audio_tool):
-        time_stamp = round(time.time())
+        self.time_stamp = round(time.time())
         self.audio_tool = audio_tool
         self.main_export_path = Path(root.export_path_var.get())
         self.wav_type_set = root.wav_type_set
         self.is_normalization = root.is_normalization_var.get()
-        self.is_testing_audio = f"{time_stamp}_" if root.is_testing_audio_var.get() else ''
+        self.is_testing_audio = f"{self.time_stamp}_" if root.is_testing_audio_var.get() else ''
         self.save_format = lambda save_path:save_format(save_path, root.save_format_var.get(), root.mp3_bit_set_var.get())
         self.align_window = TIME_WINDOW_MAPPER[root.time_window_var.get()]
         self.align_intro_val = INTRO_MAPPER[root.intro_analysis_var.get()]
         self.db_analysis_val = VOLUME_MAPPER[root.db_analysis_var.get()]
+        self.phase_low_cutoff_val = int(root.phase_low_cutoff_var.get())
+        self.phase_high_cutoff_val = int(root.phase_high_cutoff_var.get())
         self.is_save_align = root.is_save_align_var.get()#
         self.is_match_silence = root.is_match_silence_var.get()#
         self.is_spec_match = root.is_spec_match_var.get()
-        
         self.phase_option = root.phase_option_var.get()#
         self.phase_shifts = PHASE_SHIFTS_OPT[root.phase_shifts_var.get()]
+        #self.gpu_device_set = root.device_set_var.get()
+        
+        self.apollo_model = root.apollo_model_var.get()
+        self.apollo_overlap_val = int(root.apollo_overlap_var.get())
+        self.apollo_chunk_val = int(root.apollo_chunk_size_var.get())
+        self.apollo_model_location = os.path.join(APOLLO_MODELS_DIR, self.apollo_model)
+        self.is_apollo_model = os.path.isfile(self.apollo_model_location)
+        
+        if audio_tool == APOLLO_RESTORE and self.is_apollo_model:
+            apollo_model_data = ApolloModelData(self.apollo_model)
+            self.extracted_params, self.config = apollo_model_data.extracted_params, apollo_model_data.config
+            if not apollo_model_data.extracted_params:
+                self.is_apollo_model = False
+                root.apollo_model_var.set(CHOOSE_MODEL)
+
+        self.is_gpu_conversion = 0 if root.is_gpu_conversion_var.get() else -1
+        device_set = root.device_set_var.get()
+        self.device_set = device_set.split(':')[-1].strip() if ':' in device_set else device_set
+        self.is_use_directml = True if is_directml_only else root.is_use_directml_var.get()
         
     def align_inputs(self, audio_inputs, audio_file_base, audio_file_2_base, command_Text, set_progress_bar):
         audio_file_base = f"{self.is_testing_audio}{audio_file_base}"
@@ -867,6 +971,12 @@ class AudioTools():
         
         aligned_path = os.path.join('{}'.format(self.main_export_path),'{}_(Aligned).wav'.format(audio_file_2_base))
         inverted_path = os.path.join('{}'.format(self.main_export_path),'{}_(Inverted).wav'.format(audio_file_base))
+
+        if os.path.isfile(aligned_path):
+            aligned_path = aligned_path.replace(".wav", f"_{self.time_stamp}.wav")
+
+        if os.path.isfile(inverted_path):
+            inverted_path = inverted_path.replace(".wav", f"_{self.time_stamp}.wav")
 
         spec_utils.align_audio(audio_inputs[0], 
                                audio_inputs[1], 
@@ -894,12 +1004,29 @@ class AudioTools():
         
         save_path = os.path.join('{}'.format(self.main_export_path),'{}_(Matched).wav'.format(f"{self.is_testing_audio}{audio_file_base}"))
         
+        if os.path.isfile(save_path):
+            save_path = save_path.replace(".wav", f"_{self.time_stamp}.wav")
+
         match.process(
             target=target,
             reference=reference,
             results=[match.save_audiofile(save_path, wav_set=self.wav_type_set),
             ],
         )
+        
+        self.save_format(save_path)
+        
+    def phase_repair_inputs(self, audio_inputs, audio_file_base, command_Text):
+        
+        target = audio_inputs[0]
+        reference = audio_inputs[1]
+        
+        command_Text(f"Processing... ")
+        
+        save_path = os.path.join('{}'.format(self.main_export_path),'{}_(Corrected).wav'.format(f"{self.is_testing_audio}{audio_file_base}"))
+        modified_audio, target_sr = spec_utils.transfer_magnitude_phase(reference, target, low_cutoff=self.phase_low_cutoff_val, high_cutoff=self.phase_high_cutoff_val)
+
+        sf.write(save_path, modified_audio.T, target_sr, subtype=self.wav_type_set)
         
         self.save_format(save_path)
         
@@ -917,8 +1044,117 @@ class AudioTools():
             is_time_correction = True if root.is_time_correction_var.get() else False
         file_text = TIME_TEXT if self.audio_tool == TIME_STRETCH else PITCH_TEXT
         save_path = os.path.join(self.main_export_path, f"{self.is_testing_audio}{audio_file_base}{file_text}.wav")
+
+        if os.path.isfile(save_path):
+            save_path = save_path.replace(".wav", f"_{self.time_stamp}.wav")
+
         spec_utils.augment_audio(save_path, audio_file, rate, self.is_normalization, self.wav_type_set, self.save_format, is_pitch=is_pitch, is_time_correction=is_time_correction)
-   
+        
+    def apollo_process(self, audio_file, audio_file_base, set_progress_bar):
+
+        #command_Text(f"Restoring... ")
+
+        save_path = os.path.join(self.main_export_path, f"{self.is_testing_audio}{audio_file_base}_restored.wav")
+
+        if os.path.isfile(save_path):
+            save_path = save_path.replace(".wav", f"_{self.time_stamp}.wav")
+
+        restored_audio = apollo_inference.restore_process(audio_file, self.apollo_model_location, self.apollo_overlap_val, self.apollo_chunk_val, set_progress_bar, self.is_gpu_conversion, self.device_set, self.is_use_directml, self.extracted_params, self.config)
+        
+        sf.write(save_path, restored_audio.T, 44100, subtype=self.wav_type_set)
+        
+        self.save_format(save_path)
+      
+class ApolloModelData():
+    def __init__(self, apollo_model, is_dry_check=False):
+        self.is_dry_check = is_dry_check
+        self.is_model_status = False
+        self.apollo_model_name = apollo_model
+        self.extracted_params, self.config = None, None
+        self.apollo_model_location = os.path.join(APOLLO_MODELS_DIR, apollo_model)
+        self.model_hash, self.model_status = self.get_model_hash()
+        self.model_params = self.get_model_data(APOLLO_HASH_DIR)
+
+        if self.model_params:
+            config_path = os.path.join(APOLLO_CONFIG_PATH, self.model_params["config_yaml"])
+            self.extracted_params, self.config = self.extract_model_params(config_path)
+            
+        self.is_model_status = True if self.extracted_params else False
+
+    def get_model_hash(self):
+        model_hash = None
+        model_status = True
+        
+        if os.path.isfile(self.apollo_model_location):
+            if model_hash_table:
+                for (key, value) in model_hash_table.items():
+                    if self.apollo_model_location == key:
+                        model_hash = value
+                        break
+                    
+            if not model_hash:
+                try:
+                    with open(self.apollo_model_location, 'rb') as f:
+                        f.seek(- 10000 * 1024, 2)
+                        model_hash = hashlib.md5(f.read()).hexdigest()
+                except:
+                    model_hash = hashlib.md5(open(self.apollo_model_location,'rb').read()).hexdigest()
+                    
+                table_entry = {self.apollo_model_location:model_hash}
+                model_hash_table.update(table_entry)
+                
+        else:
+            model_status = False
+      
+        return model_hash, model_status
+        
+    def get_model_data(self, model_hash_dir):
+        model_settings_json = os.path.join(model_hash_dir, f"{self.model_hash}.json")
+
+        if self.model_status:
+            if os.path.isfile(model_settings_json):
+                with open(model_settings_json, 'r') as json_file:
+                    return json.load(json_file)
+            else:
+                return self.get_model_data_from_popup()
+        else:
+            return None
+      
+    def get_model_data_from_popup(self):
+        if self.is_dry_check:
+            return None
+            
+        confirm = messagebox.askyesno(
+            title=UNRECOGNIZED_MODEL[0],
+            message=f'"{self.apollo_model_name}"{UNRECOGNIZED_MODEL[1]}',
+            parent=root
+        )
+        if not confirm:
+            return None
+        
+        root.pop_up_apollo_param(self.model_hash)
+        return root.apollo_model_params
+    
+    def extract_model_params(self, config_path):
+        extracted_params, config = None, None
+        
+        try:
+            with open(config_path, 'r') as file:
+                config = yaml.safe_load(file)
+
+            # Navigate to the 'model' section and extract the parameters
+            model_params = config.get('model', {})
+            extracted_params = {
+                "sr": model_params.get("sr"),
+                "win": model_params.get("win"),
+                "feature_dim": model_params.get("feature_dim"),
+                "layer": model_params.get("layer"),
+            }
+        except Exception as e:
+            print(e)
+            
+        return extracted_params, config
+       
 class ToolTip(object):
 
     def __init__(self, widget):
@@ -1112,6 +1348,7 @@ class ComboBoxEditableMenu(ttk.Combobox):
         super().__init__(master, **kw)
 
         self.textvariable = kw.get('textvariable', tk.StringVar())
+        self.master = master
         self.pattern = pattern
         self.test = 1
         self.tooltip = ToolTip(self)
@@ -1129,11 +1366,14 @@ class ComboBoxEditableMenu(ttk.Combobox):
         if width:
             self.configure(width=width)
         
+        #self.lock_horizontal_scrolling()
+        
     def menu_combobox_configure(self):
         self.bind('<<ComboboxSelected>>', self.check_input)
-        self.bind('<Button-1>', lambda e:self.focus())
+        self.bind('<Button-1>', self.reset_scroll)
         self.bind('<FocusIn>', self.focusin)
         self.bind('<FocusOut>', lambda e: self.var_validation(is_focus_only=True))
+        self.bind('<MouseWheel>', lambda e: "break")
 
         if is_macos:
             self.bind('<Enter>', lambda e:self.button_released())
@@ -1160,6 +1400,20 @@ class ComboBoxEditableMenu(ttk.Combobox):
     
             self.textvariable.set(self.default)
             
+    def reset_scroll(self, event=None):
+        self.focus()
+
+        try:
+            # Open the dropdown menu
+            self.tk.call("ttk::combobox::Post", self)
+
+            # Access the popdown widget
+            popdown_window = self.tk.call("ttk::combobox::PopdownWindow", self)
+            listbox_path = f"{popdown_window}.f.l"
+            self.tk.call(listbox_path, "xview", "moveto", 0.0)
+        except Exception as e:
+            print(f"Error resetting dropdown scroll: {e}")
+
     def button_released(self, e=None):
         self.event_generate('<Button-3>')
         self.event_generate('<ButtonRelease-3>')
@@ -1185,6 +1439,7 @@ class ComboBoxMenu(ttk.Combobox):
 
     def menu_combobox_configure(self, is_download_menu=False, command=None, width=None):
         self.bind('<FocusIn>', self.focusin)
+        self.bind('<Button-1>', self.reset_scroll)
         self.bind('<MouseWheel>', lambda e:"break")
         
         if is_macos:
@@ -1211,6 +1466,20 @@ class ComboBoxMenu(ttk.Combobox):
         self.selection_clear()
         if is_macos:
             self.event_generate('<Leave>')
+
+    def reset_scroll(self, event=None):
+        self.focus()
+        
+        try:
+            # Open the dropdown menu
+            self.tk.call("ttk::combobox::Post", self)
+
+            # Access the popdown widget
+            popdown_window = self.tk.call("ttk::combobox::PopdownWindow", self)
+            listbox_path = f"{popdown_window}.f.l"
+            self.tk.call(listbox_path, "xview", "moveto", 0.0)
+        except Exception as e:
+            print(f"Error resetting dropdown scroll: {e}")
 
     def update_dropdown_size(self, option_list, dropdown_name, offset=185, command=None):
         dropdown_style = f"{dropdown_name}.TCombobox"
@@ -1440,6 +1709,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.menu_view_inputs_close_window = None
         self.menu_advanced_align_options_close_window = None
 
+        self.apollo_model_params = None
         self.mdx_model_params = None
         self.vr_model_params = None
         self.current_text_box = None
@@ -1450,6 +1720,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.clear_cache_torch = False
         self.vr_hash_MAPPER = load_model_hash_data(VR_HASH_JSON)
         self.mdx_hash_MAPPER = load_model_hash_data(MDX_HASH_JSON)
+        #self.apollo_hash_MAPPER = load_model_hash_data(APOLLO_HASH_JSON)
         self.mdx_name_select_MAPPER = load_model_hash_data(MDX_MODEL_NAME_SELECT)
         self.demucs_name_select_MAPPER = load_model_hash_data(DEMUCS_MODEL_NAME_SELECT)
         self.is_gpu_available = is_gpu_available
@@ -1501,11 +1772,12 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.file_one_sub_var = tk.StringVar(value=FILE_ONE_MAIN_LABEL) 
         self.file_two_sub_var = tk.StringVar(value=FILE_TWO_MAIN_LABEL) 
         self.cuda_device_list = GPU_DEVICE_NUM_OPTS
-        self.opencl_list = GPU_DEVICE_NUM_OPTS
+        self.directml_list = GPU_DEVICE_NUM_OPTS
         
         #Model Update
         self.last_found_ensembles = ENSEMBLE_OPTIONS
         self.last_found_settings = ENSEMBLE_OPTIONS
+        self.last_found_apollo_models = ENSEMBLE_OPTIONS
         self.last_found_models = ()
         self.model_data_table = ()
         self.ensemble_model_list = ()
@@ -1530,6 +1802,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.update_idletasks()
         self.fill_gpu_list()
         self.online_data_refresh(user_refresh=False, is_start_up=True)
+        self.switch_export_dir()
+        self._handle_apollo_model_selection(self.apollo_model_var.get(), is_dry_check=True)
         
     # Menu Functions
     def main_window_LABEL_SET(self, master, text):return ttk.Label(master=master, text=text, background=BG_COLOR, font=self.font_set, foreground=FG_COLOR, anchor=tk.CENTER)
@@ -1698,6 +1972,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.filePaths_saveTo_Entry.place(x=SAVETO_ENTRY_X, y=SAVETO_BUTTON_Y, width=SAVETO_ENTRY_WIDTH, height=SAVETO_ENTRY_HEIGHT, relx=0.3, rely=0.5, relwidth=0.7, relheight=0.5)
         self.filePaths_saveTo_Open = ttk.Button(master=self.filePaths_Frame, image=self.efile_img, command=lambda:OPEN_FILE_func(Path(self.export_path_var.get())) if os.path.isdir(self.export_path_var.get()) else self.error_dialoge(INVALID_EXPORT))
         self.filePaths_saveTo_Open.place(x=OPEN_BUTTON_X, y=SAVETO_BUTTON_Y, width=OPEN_BUTTON_WIDTH, height=SAVETO_ENTRY_HEIGHT, relx=0.3, rely=0.5, relwidth=0.7, relheight=0.5)
+        
+        self.filePaths_saveTo_Entry.configure(cursor="hand2")
         self.help_hints(self.filePaths_saveTo_Button, text=OUTPUT_FOLDER_ENTRY_HELP) 
         self.help_hints(self.filePaths_saveTo_Open, text=OUTPUT_FOLDER_BUTTON_HELP)     
 
@@ -1862,11 +2138,21 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.ensemble_listbox_Label_place = lambda:self.ensemble_listbox_Label.place(x=MAIN_ROW_2_X[0], y=MAIN_ROW_2_Y[1], width=0, height=LABEL_HEIGHT, relx=2/3, rely=5/11, relwidth=1/3, relheight=1/self.COL1_ROWS)
         self.ensemble_listbox_Frame = tk.Frame(self.options_Frame, highlightbackground='#04332c', highlightcolor='#04332c', highlightthicknes=1)
         self.ensemble_listbox_Option = tk.Listbox(self.ensemble_listbox_Frame, selectmode=tk.MULTIPLE, activestyle='dotbox', font=(MAIN_FONT_NAME, f"{FONT_SIZE_1}"), background='#070708', exportselection=0, relief=tk.SOLID, borderwidth=0)
+        
+        
         self.ensemble_listbox_scroll = ttk.Scrollbar(self.options_Frame, orient=tk.VERTICAL)
         self.ensemble_listbox_Option.config(yscrollcommand=self.ensemble_listbox_scroll.set)
         self.ensemble_listbox_scroll.configure(command=self.ensemble_listbox_Option.yview)
+        
+        self.ensemble_listbox_hscroll = ttk.Scrollbar(self.options_Frame, orient=tk.HORIZONTAL)
+        self.ensemble_listbox_Option.config(xscrollcommand=self.ensemble_listbox_hscroll.set)
+        self.ensemble_listbox_hscroll.configure(command=self.ensemble_listbox_Option.xview)
+        
+        
         self.ensemble_listbox_Option_place = lambda: (self.ensemble_listbox_Frame.place(x=ENSEMBLE_LISTBOX_FRAME_X, y=ENSEMBLE_LISTBOX_FRAME_Y, width=ENSEMBLE_LISTBOX_FRAME_WIDTH, height=ENSEMBLE_LISTBOX_FRAME_HEIGHT, relx=2/3, rely=6/11, relwidth=1/3, relheight=1/self.COL1_ROWS),
-                                                    self.ensemble_listbox_scroll.place(x=ENSEMBLE_LISTBOX_SCROLL_X, y=ENSEMBLE_LISTBOX_SCROLL_Y, width=ENSEMBLE_LISTBOX_SCROLL_WIDTH, height=ENSEMBLE_LISTBOX_SCROLL_HEIGHT, relx=2/3, rely=6/11, relwidth=1/10, relheight=1/self.COL1_ROWS))
+                                                      self.ensemble_listbox_scroll.place(x=ENSEMBLE_LISTBOX_SCROLL_X, y=ENSEMBLE_LISTBOX_SCROLL_Y, width=ENSEMBLE_LISTBOX_SCROLL_WIDTH, height=ENSEMBLE_LISTBOX_SCROLL_HEIGHT, relx=2/3, rely=6/11, relwidth=1/10, relheight=1/self.COL1_ROWS),
+                                                      self.ensemble_listbox_hscroll.place(x=-27, y=48, width=159, height=-12, relx=2/3, rely=7/11, relwidth=1/10, relheight=1/self.COL1_ROWS))
+
         self.ensemble_listbox_Option_pack = lambda:self.ensemble_listbox_Option.pack(fill=tk.BOTH, expand=1)
         self.help_hints(self.ensemble_listbox_Label, text=ENSEMBLE_LISTBOX_HELP)
         
@@ -1885,7 +2171,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.choose_algorithm_Option = ComboBoxMenu(self.options_Frame, textvariable=self.choose_algorithm_var, values=MANUAL_ENSEMBLE_OPTIONS)
         self.choose_algorithm_Option_place = lambda:self.choose_algorithm_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         #self.help_hints(self.mdx_segment_size_Label, text=MDX_SEGMENT_SIZE_HELP)
-        
         
         # Time Stretch
         self.time_stretch_rate_Label = self.main_window_LABEL_SET(self.options_Frame, CHOOSE_RATE_MAIN_LABEL)
@@ -1959,17 +2244,56 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.db_analysis_Option_place = lambda: self.db_analysis_Option.place(x=DB_ANALYSIS_OPTION_X, y=ENTRY_Y, width=OPTION_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=8.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         self.help_hints(self.db_analysis_Label, text=VOLUME_ANALYSIS_ALIGN_HELP)
 
+        ## PHASE FIXER TOOL ##
+
+        # Phase Low
+        self.phase_low_cutoff_Label = self.main_window_LABEL_SET(self.options_Frame, PHASE_LOW_MAIN_LABEL)
+        self.phase_low_cutoff_Label_place = lambda: self.phase_low_cutoff_Label.place(x=INTRO_ANALYSIS_LABEL_X, y=LABEL_Y, width=INTRO_ANALYSIS_LABEL_WIDTH, height=LABEL_HEIGHT, relx=2/3, rely=7.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.phase_low_cutoff_Option = ComboBoxEditableMenu(self.options_Frame, values=PHASE_LOW_CUT, textvariable=self.phase_low_cutoff_var, pattern=REG_MARGIN, default=PHASE_LOW_CUT)#
+        self.phase_low_cutoff_Option_place = lambda: self.phase_low_cutoff_Option.place(x=INTRO_ANALYSIS_OPTION_X, y=ENTRY_Y, width=OPTION_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=8.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.phase_low_cutoff_Label, text=PHASE_LOW_HELP)
+
+        # Phase High
+        self.phase_high_cutoff_Label = self.main_window_LABEL_SET(self.options_Frame, PHASE_HIGH_MAIN_LABEL)
+        self.phase_high_cutoff_Label_place = lambda: self.phase_high_cutoff_Label.place(x=DB_ANALYSIS_LABEL_X, y=LABEL_Y, width=DB_ANALYSIS_LABEL_WIDTH, height=LABEL_HEIGHT, relx=2/3, rely=7.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.phase_high_cutoff_Option = ComboBoxEditableMenu(self.options_Frame, values=PHASE_HIGH_CUT, textvariable=self.phase_high_cutoff_var, pattern=REG_MARGIN, default=PHASE_HIGH_CUT)#
+        self.phase_high_cutoff_Option_place = lambda: self.phase_high_cutoff_Option.place(x=DB_ANALYSIS_OPTION_X, y=ENTRY_Y, width=OPTION_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=8.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.phase_high_cutoff_Label, text=PHASE_HIGH_HELP)
+
         # Wav-Type
         self.wav_type_set_Label = self.main_window_LABEL_SET(self.options_Frame, WAVE_TYPE_TEXT)
         self.wav_type_set_Label_place = lambda: self.wav_type_set_Label.place(x=WAV_TYPE_SET_LABEL_X, y=LABEL_Y, width=WAV_TYPE_SET_LABEL_WIDTH, height=LABEL_HEIGHT, relx=1/3, rely=7.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         self.wav_type_set_Option = ComboBoxMenu(self.options_Frame, textvariable=self.wav_type_set_var, values=WAV_TYPE)
         self.wav_type_set_Option_place = lambda: self.wav_type_set_Option.place(x=SUB_ENT_ROW_X, y=ENTRY_Y, width=OPTION_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=8.37/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
 
+        ## APOLLO RESTORE ##
+
+        # Apollo Chunk Size
+        self.apollo_chunk_size_Label = self.main_window_LABEL_SET(self.options_Frame, APOLLO_CHUNK_MAIN_LABEL)
+        self.apollo_chunk_size_Label_place = lambda:self.apollo_chunk_size_Label.place(x=MAIN_ROW_X[0], y=MAIN_ROW_Y[0], width=0, height=LABEL_HEIGHT, relx=1/3, rely=2/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.apollo_chunk_size_Option = ComboBoxEditableMenu(self.options_Frame, values=APOLLO_CHUNK, textvariable=self.apollo_chunk_size_var, pattern=REG_CHUNK_APO, default=APOLLO_CHUNK[4])#
+        self.apollo_chunk_size_Option_place = lambda:self.apollo_chunk_size_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.apollo_chunk_size_Label, text=APOLLO_CHUNK_SIZE_HELP)
+        
+        # Apollo Overlap Size
+        self.apollo_overlap_Label = self.main_window_LABEL_SET(self.options_Frame, APOLLO_OVERLAP_MAIN_LABEL)
+        self.apollo_overlap_Label_place = lambda:self.apollo_overlap_Label.place(x=MAIN_ROW_2_X[0], y=MAIN_ROW_2_Y[0], width=0, height=LABEL_HEIGHT, relx=2/3, rely=2/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.apollo_overlap_Option = ComboBoxEditableMenu(self.options_Frame, values=APOLLO_OVERLAP, textvariable=self.apollo_overlap_var, pattern=REG_OVERLAP_APO, default=APOLLO_OVERLAP[2])#
+        self.apollo_overlap_Option_place = lambda:self.apollo_overlap_Option.place(x=MAIN_ROW_2_X[1], y=MAIN_ROW_2_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=3/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.apollo_overlap_Label, text=OVERLAP_23_HELP)
+
+        #  Choose Apollo Model
+        self.apollo_model_Label = self.main_window_LABEL_SET(self.options_Frame, CHOOSE_APOLLO_MODEL_MAIN_LABEL)
+        self.apollo_model_Label_place = lambda:self.apollo_model_Label.place(x=MAIN_ROW_X[0], y=LOW_MENU_Y[0], width=0, height=LABEL_HEIGHT, relx=1/3, rely=6/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.apollo_model_Option = ComboBoxMenu(self.options_Frame, textvariable=self.apollo_model_var, command=lambda event: self.selection_action(event, self.apollo_model_var))
+        self.apollo_model_Option_place = lambda:self.apollo_model_Option.place(x=MAIN_ROW_X[1], y=LOW_MENU_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=7/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.apollo_model_Label, text=CHOOSE_APOLLO_MODEL_HELP)
+
         ### SHARED SETTINGS ###
         
         # GPU Selection
         self.is_gpu_conversion_Option = ttk.Checkbutton(master=self.options_Frame, text=GPU_CONVERSION_MAIN_LABEL, variable=self.is_gpu_conversion_var)
-        self.is_gpu_conversion_Option_place = lambda:self.is_gpu_conversion_Option.place(x=CHECK_BOX_X, y=CHECK_BOX_Y, width=CHECK_BOX_WIDTH, height=CHECK_BOX_HEIGHT, relx=1/3, rely=5/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.is_gpu_conversion_Option_place = lambda y_move=CHECK_BOX_Y:self.is_gpu_conversion_Option.place(x=CHECK_BOX_X, y=y_move, width=CHECK_BOX_WIDTH, height=CHECK_BOX_HEIGHT, relx=1/3, rely=5/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         self.is_gpu_conversion_Disable = lambda:(self.is_gpu_conversion_Option.configure(state=tk.DISABLED), self.is_gpu_conversion_var.set(False))
         self.is_gpu_conversion_Enable = lambda:self.is_gpu_conversion_Option.configure(state=tk.NORMAL)
         self.help_hints(self.is_gpu_conversion_Option, text=IS_GPU_CONVERSION_HELP)
@@ -1989,7 +2313,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         # Sample Mode
         self.model_sample_mode_Option = ttk.Checkbutton(master=self.options_Frame, textvariable=self.model_sample_mode_duration_checkbox_var, variable=self.model_sample_mode_var)#f'Sample ({self.model_sample_mode_duration_var.get()} Seconds)'
-        self.model_sample_mode_Option_place = lambda rely=8:self.model_sample_mode_Option.place(x=CHECK_BOX_X, y=CHECK_BOX_Y, width=CHECK_BOX_WIDTH, height=CHECK_BOX_HEIGHT, relx=1/3, rely=rely/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.model_sample_mode_Option_place = lambda rely=8, y_move=CHECK_BOX_Y:self.model_sample_mode_Option.place(x=CHECK_BOX_X, y=y_move, width=CHECK_BOX_WIDTH, height=CHECK_BOX_HEIGHT, relx=1/3, rely=rely/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         self.help_hints(self.model_sample_mode_Option, text=MODEL_SAMPLE_MODE_HELP)
         
         self.GUI_LIST = (self.vr_model_Label,
@@ -2025,6 +2349,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.ensemble_listbox_Frame,
         self.ensemble_listbox_Option,
         self.ensemble_listbox_scroll,
+        self.ensemble_listbox_hscroll,
         self.chosen_audio_tool_Label,
         self.chosen_audio_tool_Option,
         self.choose_algorithm_Label,
@@ -2045,6 +2370,10 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.intro_analysis_Option,
         self.time_window_Label,
         self.time_window_Option,
+        self.phase_low_cutoff_Label,
+        self.phase_low_cutoff_Option,
+        self.phase_high_cutoff_Label,
+        self.phase_high_cutoff_Option,
         self.db_analysis_Label,
         self.db_analysis_Option,
         self.is_gpu_conversion_Option,
@@ -2054,7 +2383,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.is_secondary_stem_only_Demucs_Option,
         self.model_sample_mode_Option,
         self.is_time_correction_Option,
-        self.is_wav_ensemble_Option)
+        self.is_wav_ensemble_Option,
+        self.apollo_model_Label,
+        self.apollo_model_Option,
+        self.apollo_overlap_Label,
+        self.apollo_overlap_Option,
+        self.apollo_chunk_size_Label,
+        self.apollo_chunk_size_Option
+        )
         
         REFRESH_VARS = (self.mdx_net_model_var,
                         self.vr_model_var,
@@ -2087,7 +2423,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
 
     def focus_out_widgets(self, all_widgets, frame):
         for option in all_widgets:
-            if not type(option) is ComboBoxEditableMenu:
+            if not type(option) is ComboBoxEditableMenu and not type(option) is ComboBoxMenu:
                 option.bind('<Button-1>', lambda e:(option.focus(), self.combo_box_selection_clear(frame)))
 
     def bind_widgets(self):
@@ -2115,6 +2451,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.options_Frame.bind(right_click_button, lambda e:(self.right_click_menu_popup(e, main_menu=True), self.options_Frame.focus()))
         self.filePaths_musicFile_Entry.bind(right_click_button, lambda e:(self.input_right_click_menu(e), self.filePaths_musicFile_Entry.focus()))
         self.filePaths_musicFile_Entry.bind('<Button-1>', lambda e:(self.check_is_menu_open(INPUTS_MENU), self.filePaths_musicFile_Entry.focus()))
+        self.filePaths_saveTo_Entry.bind(right_click_button, lambda e:(self.output_right_click_menu(e), self.filePaths_saveTo_Entry.focus()))
+        self.filePaths_saveTo_Entry.bind('<Button-1>', lambda e:(self.output_right_click_menu(e), self.filePaths_saveTo_Entry.focus()))
 
         self.fileOne_Entry.bind('<Button-1>', lambda e:self.menu_batch_dual())
         self.fileTwo_Entry.bind('<Button-1>', lambda e:self.menu_batch_dual())
@@ -2191,6 +2529,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             
             self.process_input_selections()
             self.update_inputPaths()
+            self.switch_export_dir()
 
     def export_select_filedialog(self):
         """Make user select a folder to export the converted files in"""
@@ -2200,8 +2539,12 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         path = self.show_file_dialog(dialoge_type=CHOOSE_EXPORT_FIR)
 
         if path:  # Path selected
-            self.export_path_var.set(path)
-            export_path = self.export_path_var.get()
+            if not can_write_to_directory(path):
+                self.error_dialoge(INVALID_FOLDER_ERROR_UNWRITABLE_TEXT)
+            else:
+                self.export_path_var.set(path)
+                self.last_export_path_var.set(path)
+                export_path = self.export_path_var.get()
             
         return export_path
      
@@ -2279,14 +2622,21 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         except Exception as e:
             self.error_log_var.set(error_text(TEMP_FILE_DELETION_TEXT, e))
         
-    def get_files_from_dir(self, directory, ext, is_mdxnet=False):
+    def get_files_from_dir(self, directory, ext, is_mdxnet=False, is_apollo=False):
         """Gets files from specified directory that ends with specified extention"""
         
-        return tuple(
-            x if is_mdxnet and x.endswith(CKPT) else os.path.splitext(x)[0]
+        if is_apollo:
+            return tuple(
+            x
             for x in os.listdir(directory)
             if x.endswith(ext)
         )
+        else:
+            return tuple(
+                x if is_mdxnet and x.endswith(CKPT) else os.path.splitext(x)[0]
+                for x in os.listdir(directory)
+                if x.endswith(ext)
+            )
         
     def return_ensemble_stems(self, is_primary=False): 
         """Grabs and returns the chosen ensemble stems."""
@@ -2399,6 +2749,31 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             right_click_release_linux(right_click_menu)
         finally:
             right_click_menu.grab_release()
+
+    def output_right_click_menu(self, event):
+
+        label_text = "Disable Save to Input Path" if self.is_save_to_input_path_var.get() else "Enable Save to Input Path"
+        is_enabled = self.is_save_to_input_path_var.get()
+
+        right_click_menu = tk.Menu(self, font=(MAIN_FONT_NAME, FONT_SIZE_1), tearoff=0)
+        right_click_menu.add_command(label=label_text, command=lambda:self.switch_export_menu_selection(is_enabled))
+        
+        try:
+            right_click_menu.tk_popup(event.x_root,event.y_root)
+            right_click_release_linux(right_click_menu)
+        finally:
+            right_click_menu.grab_release()
+
+    def switch_export_menu_selection(self, is_enabled):
+        self.is_save_to_input_path_var.set(False if is_enabled else True)
+        self.switch_export_dir()
+
+    def switch_export_dir(self):
+        if self.is_save_to_input_path_var.get():
+            self.export_path_var.set(os.path.dirname(self.inputPaths[0]) if self.inputPaths else '')
+        else:
+            self.export_path_var.set(self.last_export_path_var.get() if self.last_export_path_var.get() else DEFAULT_SAVE_PATH)
+            self.last_export_path_var.set(self.export_path_var.get())
 
     def input_dual_right_click_menu(self, event, is_primary:bool):
         input_path = self.fileOneEntry_Full_var.get() if is_primary else self.fileTwoEntry_Full_var.get()
@@ -2525,6 +2900,12 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         sf.write(audio_sample, sample, 44100)
         
         return audio_sample
+
+    def verify_default_save_path_exists(self):
+        if not os.path.isdir(DEFAULT_SAVE_PATH):
+            os.mkdir(DEFAULT_SAVE_PATH)
+
+        return DEFAULT_SAVE_PATH
 
     #--Right Click Menu Pop-Ups--
 
@@ -3173,18 +3554,21 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             if cuda_available:
                 self.cuda_device_list = [f"{torch.cuda.get_device_properties(i).name}:{i}" for i in range(torch.cuda.device_count())]
                 self.cuda_device_list.insert(0, DEFAULT)
-                #print(self.cuda_device_list)
+                print(self.cuda_device_list)
             
-            # if directml_available:
-            #     self.opencl_list = [f"{torch_directml.device_name(i)}:{i}" for i in range(torch_directml.device_count())]
-            #     self.opencl_list.insert(0, DEFAULT)
+            if directml_available:
+                try:
+                    self.directml_list = [f"{torch_directml.device_name(i)}:{i}" for i in range(torch_directml.device_count())] # type: ignore
+                    self.directml_list.insert(0, DEFAULT)
+                except NameError:
+                    self.directml_list = [DEFAULT]  # DirectML not available
         except Exception as e:
             print(e)
             
-        # if is_cuda_only:
-        #     self.is_use_opencl_var.set(False)
+        if is_cuda_only:
+            self.is_use_directml_var.set(False)
             
-        check_gpu_list = self.cuda_device_list#self.opencl_list if is_opencl_only or self.is_use_opencl_var.get() else self.cuda_device_list
+        check_gpu_list = self.directml_list if is_directml_only or self.is_use_directml_var.get() else self.cuda_device_list
         if not self.device_set_var.get() in check_gpu_list:
             self.device_set_var.set(DEFAULT)
 
@@ -3235,7 +3619,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.model_sample_mode_duration_var.set(value)
             self.model_sample_mode_duration_checkbox_var.set(SAMPLE_MODE_CHECKBOX(value))
             self.model_sample_mode_duration_label_var.set(f'{value} {SECONDS_TEXT}')
-            
+
         #Settings Tab 1
         settings_menu_main_Frame = self.menu_FRAME_SET(tab1)
         settings_menu_main_Frame.grid(row=0)  
@@ -3308,6 +3692,10 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         audio_format_title_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, GENERAL_PROCESS_SETTINGS_TEXT)
         audio_format_title_Label.grid(pady=MENU_PADDING_2)
         
+        is_save_to_input_path_Option = ttk.Checkbutton(settings_menu_format_Frame, text=SAVE_TO_INPUT_PATH_TEXT, width=GEN_SETTINGS_WIDTH, variable=self.is_save_to_input_path_var, command=self.switch_export_dir) 
+        is_save_to_input_path_Option.grid()
+        self.help_hints(is_save_to_input_path_Option, text=IS_SAVE_TO_INPUT_HELP)
+
         is_testing_audio_Option = ttk.Checkbutton(settings_menu_format_Frame, text=SETTINGS_TEST_MODE_TEXT, width=GEN_SETTINGS_WIDTH, variable=self.is_testing_audio_var) 
         is_testing_audio_Option.grid()
         self.help_hints(is_testing_audio_Option, text=IS_TESTING_AUDIO_HELP)
@@ -3335,11 +3723,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         change_model_default_Button = ttk.Button(settings_menu_format_Frame, text=CHANGE_MODEL_DEFAULTS_TEXT, command=lambda:self.pop_up_change_model_defaults(settings_menu), width=SETTINGS_BUT_WIDTH-2)#
         change_model_default_Button.grid(pady=MENU_PADDING_4)
 
-        #if not is_choose_arch:
-        self.vocal_splitter_Button_opt(settings_menu, settings_menu_format_Frame, width=SETTINGS_BUT_WIDTH-2, pady=MENU_PADDING_4)
+        if not is_choose_arch:
+            self.vocal_splitter_Button_opt(settings_menu, settings_menu_format_Frame, width=SETTINGS_BUT_WIDTH-2, pady=MENU_PADDING_4)
 
         if not is_macos and self.is_gpu_available:
-            gpu_list_options = lambda:self.loop_gpu_list(device_set_Option, 'gpudevice', self.cuda_device_list)#self.opencl_list if is_opencl_only or self.is_use_opencl_var.get() else self.cuda_device_list)
+            gpu_list_options = lambda:self.loop_gpu_list(device_set_Option, 'gpudevice', self.directml_list if is_directml_only or self.is_use_directml_var.get() else self.cuda_device_list)
             device_set_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, CUDA_NUM_TEXT)
             device_set_Label.grid(pady=MENU_PADDING_2)
             
@@ -3348,14 +3736,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             gpu_list_options()
             self.help_hints(device_set_Label, text=IS_CUDA_SELECT_HELP)
             
-            # if is_choose_arch:
-            #     is_use_opencl_Option = ttk.Checkbutton(settings_menu_format_Frame, 
-            #                                            text=USE_OPENCL_TEXT, 
-            #                                            width=9, 
-            #                                            variable=self.is_use_opencl_var, 
-            #                                            command=lambda:(gpu_list_options(), self.device_set_var.set(DEFAULT))) 
-            #     is_use_opencl_Option.grid()
-            #     self.help_hints(is_use_opencl_Option, text=IS_NORMALIZATION_HELP)
+            if is_choose_arch:
+                is_use_directml_Option = ttk.Checkbutton(settings_menu_format_Frame, 
+                                                       text=USE_DIRECTML_TEXT, 
+                                                       width=11, 
+                                                       variable=self.is_use_directml_var, 
+                                                       command=lambda:(gpu_list_options(), self.device_set_var.set(DEFAULT))) 
+                is_use_directml_Option.grid()
+                self.help_hints(is_use_directml_Option, text=IS_DIRECTML_HELP)
 
         model_sample_mode_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, MODEL_SAMPLE_MODE_SETTINGS_TEXT)
         model_sample_mode_Label.grid(pady=MENU_PADDING_2)
@@ -4205,6 +4593,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         mdx_download_list = model_data["mdx_download_list"]
         demucs_download_list = model_data["demucs_download_list"]
         mdx_download_list.update(model_data["mdx23c_download_list"])
+        mdx_download_list.update(model_data["other_network_list"])
+        #print(model_data["roformer_download_list_fixed"])
 
         def create_link(link):
             final_link = lambda:webbrowser.open_new_tab(link)
@@ -4215,27 +4605,31 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 widgets.destroy()
                 
             main_selection = model_selection_var.get()
+            is_defined_link = False
             
             MAIN_ROW = 0
-            
+
             self.menu_sub_LABEL_SET(manual_downloads_link_Frame, 'Download Link(s)').grid(row=0,column=0,padx=0,pady=MENU_PADDING_4)
             
             if VR_ARCH_TYPE in main_selection:
                 main_selection = vr_download_list[main_selection]
                 model_dir = VR_MODELS_DIR
-            elif MDX_ARCH_TYPE in main_selection or MDX_23_NAME in main_selection:
+            elif DEMUCS_ARCH_TYPE in main_selection:
+                model_dir = DEMUCS_NEWER_REPO_DIR if 'v3' in main_selection or 'v4' in main_selection else DEMUCS_MODELS_DIR
+                main_selection = demucs_download_list[main_selection]
+            else:
                 if isinstance(mdx_download_list[main_selection], dict):
                     main_selection = mdx_download_list[main_selection]
-                    main_selection = list(main_selection.keys())[0]
+                    main_selection_list = list(main_selection.keys())
+                    if len(main_selection_list) == 1:
+                        main_selection = main_selection_list[0]
+                    else:
+                        main_selection, is_defined_link = main_selection[main_selection_list[0]], True
                 else:
                     main_selection = mdx_download_list[main_selection]
                     
                 model_dir = MDX_MODELS_DIR
-
-            elif DEMUCS_ARCH_TYPE in main_selection:
-                model_dir = DEMUCS_NEWER_REPO_DIR if 'v3' in main_selection or 'v4' in main_selection else DEMUCS_MODELS_DIR
-                main_selection = demucs_download_list[main_selection]
-
+                
             if type(main_selection) is dict:
                 for links in main_selection.values():
                     MAIN_ROW += 1
@@ -4243,7 +4637,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     link = create_link(links)
                     link_button = ttk.Button(manual_downloads_link_Frame, text=f"Open Link to Model{button_text}", command=link).grid(row=MAIN_ROW,column=0,padx=0,pady=MENU_PADDING_1)
             else:
-                link = f"{NORMAL_REPO}{main_selection}"
+                link = f"{'' if is_defined_link else NORMAL_REPO}{main_selection}"
                 link_button = ttk.Button(manual_downloads_link_Frame, text=OPEN_LINK_TO_MODEL_TEXT, command=lambda:webbrowser.open_new_tab(link))
                 link_button.grid(row=1,column=0,padx=0,pady=MENU_PADDING_2)
         
@@ -4277,11 +4671,16 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         for model_selection_mdx in mdx_download_list.keys():
             
             model_name = mdx_download_list[model_selection_mdx]
-            
+
             if isinstance(model_name, dict):
                 items_list = list(model_name.items())
-                model_name, config = items_list[0]
-                config_link = f"{MDX23_CONFIG_CHECKS}{config}"
+                if len(items_list) == 1:
+                    model_name, config = items_list[0]
+                    config_link = f"{MDX23_CONFIG_CHECKS}{config}"
+                else:
+                    model_name, model_link = items_list[0]
+                    config, config_link = items_list[1]
+                
                 config_local = os.path.join(MDX_C_CONFIG_PATH, config)
                 if not os.path.isfile(config_local):
                     try:
@@ -4289,9 +4688,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                             with open(config_local, 'wb') as out_file:
                                 out_file.write(response.read())
                     except Exception as e:
+                        print(e)
                         model_name = None
-
-            #print(model_name)
                 
             if model_name: 
                 if not os.path.isfile(os.path.join(MDX_MODELS_DIR, model_name)):
@@ -4385,12 +4783,19 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         is_new_update = self.online_data_refresh(confirmation_box=True)
         is_download_in_app_var = tk.BooleanVar(value=False)
+        is_rollback = True if ROLLBACK_FOUND_TEXT in self.app_update_button_Text_var.get() else False
+        menu_title = ROLLBACK_FOUND_TEXT if is_rollback else UPDATE_FOUND_TEXT
         
         def update_type():
             if is_download_in_app_var.get():
                 self.download_item(is_update_app=True)
             else:
-                webbrowser.open_new_tab(self.download_update_link_var.get())
+                if is_rollback:
+                    url = self.online_data["roll_back_macos_arm64_url" if SYSTEM_PROC == ARM or ARM in SYSTEM_ARCH else "roll_back_macos_x86_64_url"] if is_macos else self.online_data["roll_back_win_url"]
+                else:
+                    url = self.download_update_link_var.get()
+                    
+                webbrowser.open_new_tab(url)
 
             update_confirmation_win.destroy()
             
@@ -4401,7 +4806,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             update_confirmation_Frame = self.menu_FRAME_SET(update_confirmation_win)
             update_confirmation_Frame.grid(row=0)  
             
-            update_found_label = self.menu_title_LABEL_SET(update_confirmation_Frame, UPDATE_FOUND_TEXT, width=15)
+            update_found_label = self.menu_title_LABEL_SET(update_confirmation_Frame, menu_title, width=15)
             update_found_label.grid(row=0,column=0,padx=0,pady=MENU_PADDING_2)
             
             confirm_update_label = self.menu_sub_LABEL_SET(update_confirmation_Frame, UPDATE_CONFIRMATION_TEXT, font_size=FONT_SIZE_3)
@@ -4413,7 +4818,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             no_button = ttk.Button(update_confirmation_Frame, text=NO_TEXT, command=lambda:(update_confirmation_win.destroy()))
             no_button.grid(row=3,column=0,padx=0,pady=MENU_PADDING_1)
             
-            if is_windows:
+            if is_windows and not is_rollback:
                 download_outside_application_button = ttk.Checkbutton(update_confirmation_Frame, variable=is_download_in_app_var, text='Download Update in Application')
                 download_outside_application_button.grid(row=4,column=0,padx=0,pady=MENU_PADDING_1)
 
@@ -4775,7 +5180,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         with open(os.path.join(MDX_HASH_DIR, f'{mdx_model_hash}.json'), "w") as outfile:
             outfile.write(mdx_model_params_dump)
         
-    def pop_up_mdx_c_param(self, mdx_model_hash):
+    def pop_up_mdx_c_param(self, mdx_model_hash, is_apollo_model=False):
         """Opens MDX-C param settings"""
 
         mdx_c_param_menu = tk.Toplevel()
@@ -4783,10 +5188,12 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         get_mdx_c_params = lambda dir, ext:tuple(os.path.splitext(x)[0] for x in os.listdir(dir) if x.endswith(ext))
         new_mdx_c_params = get_mdx_c_params(MDX_C_CONFIG_PATH, YAML)
         mdx_c_model_param_var = tk.StringVar(value=NONE_SELECTED)
+        is_roformer_model_var = tk.BooleanVar(value=False)
         
         def pull_data():
             mdx_c_model_params = {
-                'config_yaml': f"{mdx_c_model_param_var.get()}{YAML}"}
+                'config_yaml': f"{mdx_c_model_param_var.get()}{YAML}",
+                'is_roformer': is_roformer_model_var.get()}
             
             if not mdx_c_model_param_var.get() == NONE_SELECTED:
                 self.pop_up_mdx_model_sub_json_dump(mdx_c_model_params, mdx_model_hash)
@@ -4810,6 +5217,9 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         mdx_c_model_param_Option.grid(padx=20,pady=MENU_PADDING_1)
         self.help_hints(mdx_c_model_param_Label, text=VR_MODEL_PARAM_HELP)
 
+        is_roformer_model_Option = ttk.Checkbutton(mdx_c_param_Frame, text=ROFORMER_MODEL_TEXT, width=SET_MENUS_CHECK_WIDTH, variable=is_roformer_model_var) 
+        is_roformer_model_Option.grid(pady=3)
+
         mdx_c_param_confrim_Button = ttk.Button(mdx_c_param_Frame, text=CONFIRM_TEXT, command=lambda:pull_data())
         mdx_c_param_confrim_Button.grid(pady=MENU_PADDING_1)
         
@@ -4819,6 +5229,70 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         mdx_c_param_menu.protocol("WM_DELETE_WINDOW", cancel)
         
         self.menu_placement(mdx_c_param_menu, CHOOSE_MODEL_PARAM_TEXT, pop_up=True)
+        
+    def pop_up_apollo_model_sub_json_dump(self, apollo_model_params, apollo_model_hash):
+        """Dumps current selected MDX-Net model settings to a json named after model hash"""
+        
+        self.apollo_model_params = apollo_model_params
+
+        apollo_model_params_dump = json.dumps(apollo_model_params, indent=4)
+        with open(os.path.join(APOLLO_HASH_DIR, f'{apollo_model_hash}.json'), "w") as outfile:
+            outfile.write(apollo_model_params_dump)
+        
+    def pop_up_apollo_param(self, apollo_model_hash):
+        """Opens MDX-C param settings"""
+
+        apollo_param_menu = tk.Toplevel()
+        
+        get_apollo_params = lambda dir, ext:tuple(os.path.splitext(x)[0] for x in os.listdir(dir) if x.endswith(ext))
+        new_apollo_params = get_apollo_params(APOLLO_CONFIG_PATH, YAML)
+        apollo_model_param_var = tk.StringVar(value=NONE_SELECTED)
+
+        def pull_data():
+            apollo_model_params = {
+                'config_yaml': f"{apollo_model_param_var.get()}{YAML}"}
+            
+            if not apollo_model_param_var.get() == NONE_SELECTED:
+                self.pop_up_apollo_model_sub_json_dump(apollo_model_params, apollo_model_hash)
+                apollo_param_menu.destroy()
+            else:
+                self.apollo_model_params = None
+        
+        def cancel():
+            self.apollo_model_params = None
+            apollo_param_menu.destroy()
+        
+        apollo_param_Frame = self.menu_FRAME_SET(apollo_param_menu)
+        apollo_param_Frame.grid(row=0)  
+        
+        apollo_param_title_title = self.menu_title_LABEL_SET(apollo_param_Frame, APOLLO_MODEL_PARAMETERS_TEXT, width=28)
+        apollo_param_title_title.grid(row=0,column=0,padx=0,pady=0)
+                
+        apollo_model_param_Label = self.menu_sub_LABEL_SET(apollo_param_Frame, SELECT_MODEL_PARAM_TEXT)
+        apollo_model_param_Label.grid(pady=MENU_PADDING_1)
+        apollo_model_param_Option = ComboBoxMenu(apollo_param_Frame, textvariable=apollo_model_param_var, values=new_apollo_params, width=30)
+        apollo_model_param_Option.grid(padx=20,pady=MENU_PADDING_1)
+        self.help_hints(apollo_model_param_Label, text=VR_MODEL_PARAM_HELP)
+
+        apollo_param_confrim_Button = ttk.Button(apollo_param_Frame, text=CONFIRM_TEXT, command=lambda:pull_data())
+        apollo_param_confrim_Button.grid(pady=MENU_PADDING_1)
+        
+        apollo_param_cancel_Button = ttk.Button(apollo_param_Frame, text=CANCEL_TEXT, command=cancel)
+        apollo_param_cancel_Button.grid(pady=MENU_PADDING_1)
+        
+        apollo_param_menu.protocol("WM_DELETE_WINDOW", cancel)
+        
+        self.menu_placement(apollo_param_menu, CHOOSE_MODEL_PARAM_TEXT, pop_up=True)
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         
     def pop_up_vr_param(self, vr_model_hash):
         """Opens VR param settings"""
@@ -5179,7 +5653,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     
                     if not is_start_up:
                         if is_beta_version:
-                            self.app_update_status_Text_var.set(f"Roll Back: {self.lastest_version}")
+                            self.app_update_status_Text_var.set(f"{ROLLBACK_FOUND_TEXT}: {self.lastest_version}")
                             self.app_update_button_Text_var.set(ROLL_BACK_TEXT)
                         else:
                             self.app_update_status_Text_var.set(f"Update Found: {self.lastest_version}")
@@ -5196,7 +5670,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     if not user_refresh:
                         if not is_beta_version and not self.lastest_version == current_patch:
                             self.command_Text.write(NEW_UPDATE_FOUND_TEXT(self.lastest_version))
-
 
                 is_update_params = self.is_auto_update_model_params if is_start_up else self.is_auto_update_model_params_var.get()
                 
@@ -5276,6 +5749,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.mdx_download_list = self.online_data["mdx_download_list"]
         self.demucs_download_list = self.online_data["demucs_download_list"]
         self.mdx_download_list.update(self.online_data["mdx23c_download_list"])
+        self.mdx_download_list.update(self.online_data["other_network_list"])
         
         if not self.decoded_vip_link is NO_CODE:
             self.vr_download_list.update(self.online_data["vr_download_vip_list"])
@@ -5299,8 +5773,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             for (selectable, model) in self.mdx_download_list.items():
                 if isinstance(model, dict):
                     items_list = list(model.items())
-                    model_name, config = items_list[0]
-                    config_link = f"{MDX23_CONFIG_CHECKS}{config}"
+                    
+                    if len(items_list) == 1:
+                        model_name, config = items_list[0]
+                        config_link = f"{MDX23_CONFIG_CHECKS}{config}"
+                    else:
+                        model_name, model_link = items_list[0]
+                        config, config_link = items_list[1]
+                    
                     config_local = os.path.join(MDX_C_CONFIG_PATH, config)
                     if not os.path.isfile(config_local):
                         with urllib.request.urlopen(config_link) as response:
@@ -5420,10 +5900,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             for selected_model in self.mdx_download_list.items():
                 if selection in selected_model:
                     if isinstance(selected_model[1], dict):
-                        model_name = list(selected_model[1].keys())[0]
+                        model_dict_keys = list(selected_model[1].keys())
+                        model_name = model_dict_keys[0]   
+                        model_link = "{}{}".format(model_repo, model_name) if len(model_dict_keys) == 1 else selected_model[1][model_name]
                     else:
                         model_name = str(selected_model[1])
-                    self.download_link_path_var.set("{}{}".format(model_repo, model_name))
+                        model_link = "{}{}".format(model_repo, model_name)
+                    self.download_link_path_var.set(model_link)
                     self.download_save_path_var.set(os.path.join(MDX_MODELS_DIR, model_name))
                     break
 
@@ -5580,10 +6063,10 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.update_available_models()
         self.after(600, self.update_loop)
           
-    def update_menus(self, option_widget:ComboBoxMenu, style_name, command, new_items, last_items=None, base_options=None):
+    def update_menus(self, option_widget:ComboBoxMenu, style_name, command, new_items, last_items=None, base_options=None, is_apollo=False):
                 
         if new_items != last_items:
-            formatted_items = [item.replace("_", " ") for item in new_items]
+            formatted_items = [item if is_apollo else item.replace("_", " ") for item in new_items]
             if not formatted_items and base_options:
                 base_options = [option for option in base_options if option != OPT_SEPARATOR_SAVE]
             
@@ -5592,7 +6075,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             option_widget.update_dropdown_size(formatted_items, style_name, command=command)
             return new_items
         return last_items
-          
+        
     def update_available_models(self):
         """
         Loops through all models in each model directory and adds them to the appropriate model menu.
@@ -5606,6 +6089,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         new_demucs_models = self.get_files_from_dir(DEMUCS_MODELS_DIR, (CKPT, '.gz', '.th')) + self.get_files_from_dir(DEMUCS_NEWER_REPO_DIR, YAML)
         new_ensembles_found = self.get_files_from_dir(ENSEMBLE_CACHE_DIR, JSON)
         new_settings_found = self.get_files_from_dir(SETTINGS_CACHE_DIR, JSON)
+        new_apollo_models = self.get_files_from_dir(APOLLO_MODELS_DIR, (BIN_EXT, CKPT), is_apollo=True)
         new_models_found = new_vr_models + new_mdx_models + new_demucs_models
         is_online = self.is_online_model_menu
         
@@ -5613,7 +6097,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             current_selection = option_menu.get()
             option_list = [fix_name(file_name, name_mapper) for file_name in model_list] if name_mapper else model_list
             sorted_options = natsort.natsorted(option_list)
-            option_list_option_menu = sorted_options + [OPT_SEPARATOR, DOWNLOAD_MORE] if self.is_online else sorted_options
+            option_list_option_menu = sorted_options + [OPT_SEPARATOR, OPEN_MODELS_FOLDER, DOWNLOAD_MORE] if self.is_online else sorted_options + [OPT_SEPARATOR, OPEN_MODELS_FOLDER]
             
             if not option_list and self.is_online:
                 option_list_option_menu = [option for option in option_list_option_menu if option != OPT_SEPARATOR]
@@ -5662,6 +6146,16 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                                                       last_items=self.last_found_settings, 
                                                       base_options=SAVE_SET_OPTIONS
         )
+        
+        self.last_found_apollo_models = self.update_menus(option_widget=self.apollo_model_Option, 
+                                                      style_name='apollomodels',
+                                                      command=None, 
+                                                      new_items=new_apollo_models, 
+                                                      last_items=self.last_found_apollo_models, 
+                                                      base_options=[OPT_SEPARATOR, OPEN_MODELS_FOLDER],
+                                                      is_apollo=True
+        )
+        
 
     def update_main_widget_states_mdx(self):
         if not self.mdx_net_model_var.get() == DOWNLOAD_MORE:
@@ -5735,7 +6229,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             if audio_tool == ALIGN_INPUTS:
                 self.file_one_sub_var.set(FILE_ONE_MAIN_LABEL)
                 self.file_two_sub_var.set(FILE_TWO_MAIN_LABEL)
-            elif audio_tool == MATCH_INPUTS:
+            elif audio_tool == MATCH_INPUTS or audio_tool == PHASE_REPAIR:
                 self.file_one_sub_var.set(FILE_ONE_MATCH_MAIN_LABEL)
                 self.file_two_sub_var.set(FILE_TWO_MATCH_MAIN_LABEL)
 
@@ -5770,6 +6264,29 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                                self.fileTwo_Open_place,
                                self.wav_type_set_Label_place,
                                self.wav_type_set_Option_place],
+                PHASE_REPAIR: [self.fileOne_Label_place, 
+                               self.fileOne_Entry_place, 
+                               self.fileTwo_Label_place, 
+                               self.fileTwo_Entry_place,
+                               self.fileOne_Open_place,
+                               self.fileTwo_Open_place,
+                               self.wav_type_set_Label_place,
+                               self.wav_type_set_Option_place,
+                               self.phase_low_cutoff_Label_place,
+                               self.phase_low_cutoff_Option_place,
+                               self.phase_high_cutoff_Label_place,
+                               self.phase_high_cutoff_Option_place#APOLLO_RESTORE
+                               ],
+                APOLLO_RESTORE: [self.apollo_model_Label_place,
+                                self.apollo_model_Option_place,
+                                self.apollo_overlap_Label_place,
+                                self.apollo_overlap_Option_place,
+                                self.apollo_chunk_size_Label_place,
+                                self.apollo_chunk_size_Option_place,
+                                lambda: self.is_gpu_conversion_Option_place(y_move=-17),
+                                lambda: self.model_sample_mode_Option_place(rely=6, y_move=-17),
+                                self.save_current_settings_Label_place, 
+                                self.save_current_settings_Option_place],
             }
             place_widgets(*audio_tool_options.get(audio_tool, []))
         elif process_method == ENSEMBLE_MODE:
@@ -5819,26 +6336,26 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         """Updates the available stems for selected Demucs model"""
         
         model_stems = [stem for stem in model_stems]
-        
+        primary_stem = model_stems[0]
+        secondary_stem = model_stems[1] if len(model_stems) == 2 else None
+
         if len(model_stems) >= 3:
             model_stems.insert(0, ALL_STEMS)
             self.mdxnet_stems_var.set(ALL_STEMS)
         else:
-            self.mdxnet_stems_var.set(model_stems[0])
+            self.mdxnet_stems_var.set(primary_stem)
         
         if self.mdxnet_stems_var.get() == ALL_STEMS:
             self.update_stem_checkbox_labels(PRIMARY_STEM, disable_boxes=True)
-        elif self.mdxnet_stems_var.get() == VOCAL_STEM:
-            self.update_stem_checkbox_labels(VOCAL_STEM)
-            self.is_stem_only_Options_Enable()
         else:
+            self.update_stem_checkbox_labels(primary_stem, defined_secondary_stem=secondary_stem)
             self.is_stem_only_Options_Enable()
 
         if not self.mdx_net_model_var.get() == CHOOSE_MODEL:
             self.mdxnet_stems_Option['values'] = model_stems
             self.mdxnet_stems_Option.command(lambda e:self.update_stem_checkbox_labels(self.mdxnet_stems_var.get()))
                             
-    def update_stem_checkbox_labels(self, selection, demucs=False, disable_boxes=False, is_disable_demucs_boxes=True):
+    def update_stem_checkbox_labels(self, selection, demucs=False, disable_boxes=False, is_disable_demucs_boxes=True, defined_secondary_stem=None):
         """Updates the "save only" checkboxes based on the model selected"""
         
         stem_text = self.is_primary_stem_only_Text_var, self.is_secondary_stem_only_Text_var
@@ -5871,7 +6388,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 self.is_secondary_stem_only_Demucs_Option.configure(state=tk.NORMAL)
                 
         stem_text[0].set(f"{selection} Only")
-        stem_text[1].set(f"{secondary_stem(selection)} Only")
+        stem_text[1].set(f"{defined_secondary_stem if defined_secondary_stem else secondary_stem(selection)} Only")
      
     def update_ensemble_algorithm_menu(self, is_4_stem=False):
         options = ENSEMBLE_TYPE_4_STEM if is_4_stem else ENSEMBLE_TYPE
@@ -5908,7 +6425,28 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         if not self.is_menu_settings_open and selection == DOWNLOAD_MORE:
             self.update_checkbox_text()
             self.menu_settings(select_tab_3=True)
+            
+        if not self.is_menu_settings_open and selection == OPEN_MODELS_FOLDER:
+            self.update_checkbox_text()
+            self.open_model_directory()
+        else:
+            # Handle Apollo mode case.
+            if self.chosen_process_method_var.get() == AUDIO_TOOLS and self.chosen_audio_tool_var.get() == APOLLO_RESTORE:
+                return self._handle_apollo_model_selection(selection)
 
+    def open_model_directory(self):
+        process_method = self.chosen_process_method_Option.get()
+        
+        if process_method == VR_ARCH_PM:
+            OPEN_FILE_func(VR_MODELS_DIR)
+        elif process_method == MDX_ARCH_TYPE:
+            OPEN_FILE_func(MDX_MODELS_DIR)
+        elif process_method == DEMUCS_ARCH_TYPE:
+            OPEN_FILE_func(DEMUCS_MODELS_DIR)
+        elif process_method == AUDIO_TOOLS:
+            OPEN_FILE_func(APOLLO_MODELS_DIR)
+            self.apollo_model_var.set(CHOOSE_MODEL)
+            
     def _handle_model_by_chosen_method(self, selection):
         """Handles model selection based on the currently chosen method."""
         current_method = self.chosen_process_method_var.get()
@@ -5923,10 +6461,20 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             return self.model_stems_list.index(selection)
         return False
 
+    def _handle_apollo_model_selection(self, selection, is_dry_check=False):
+        """Handles Apollo model selections."""
+        
+        if not selection == CHOOSE_MODEL:
+            apollo_config_check = ApolloModelData(selection, is_dry_check=is_dry_check)
+            if not apollo_config_check.is_model_status:
+                self.apollo_model_var.set(CHOOSE_MODEL)
+            
+        #return False
+
     def selection_action_models_sub(self, selection, ai_type, var: tk.StringVar):
         """Takes input directly from the selection_action_models parent function"""
 
-        if selection == DOWNLOAD_MORE:
+        if selection == DOWNLOAD_MORE or selection == OPEN_MODELS_FOLDER:
             is_model_status = False
         else:
             model_data = self.assemble_model_data(selection, ai_type)[0]
@@ -5956,7 +6504,12 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                         self.mdx_segment_size_Option_place()
                     self.overlap_mdx_Label_place()
                     self.overlap_mdx23_Option_place()
-                    self.update_button_states_mdx(model_data.mdx_model_stems)
+
+                    if model_data.is_target_instrument:
+                        self.update_stem_checkbox_labels(model_data.primary_stem)
+                    else:
+                        self.update_button_states_mdx(model_data.mdx_model_stems)
+                #elif model_data.is_target_instrument and 
                 else:
                     if ai_type == MDX_ARCH_TYPE:
                         self.mdx_segment_size_Label_place()
@@ -6184,9 +6737,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
     def process_initialize(self):
         """Verifies the input/output directories are valid and prepares to thread the main process."""
         
+        #self.is_save_to_input_path = True
+
+        is_audio_tools = False if self.chosen_process_method_var.get() != AUDIO_TOOLS else True
+
         if not (
             self.chosen_process_method_var.get() == AUDIO_TOOLS 
-            and self.chosen_audio_tool_var.get() in [ALIGN_INPUTS, MATCH_INPUTS] 
+            and self.chosen_audio_tool_var.get() in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR] 
             and self.fileOneEntry_var.get() 
             and self.fileTwoEntry_var.get()
         ) and not (
@@ -6195,23 +6752,26 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.error_dialoge(INVALID_INPUT)
             return
 
-            
-        if not os.path.isdir(self.export_path_var.get()):
+        if not os.path.isdir(self.export_path_var.get()) and not self.is_save_to_input_path_var.get():
             self.error_dialoge(INVALID_EXPORT)
+            return
+
+        if not can_write_to_directory(self.export_path_var.get()) and not self.is_save_to_input_path_var.get():
+            self.error_dialoge(INVALID_FOLDER_ERROR_UNWRITABLE_TEXT)
             return
 
         if not self.process_storage_check():
             return
 
-        if self.chosen_process_method_var.get() != AUDIO_TOOLS:
+        if is_audio_tools:
+            target_function = self.process_tool_start
+        else:
             if not self.process_preliminary_checks():
                 error_msg = INVALID_ENSEMBLE if self.chosen_process_method_var.get() == ENSEMBLE_MODE else INVALID_MODEL
                 self.error_dialoge(error_msg)
                 return
             target_function = self.process_start
-        else:
-            target_function = self.process_tool_start
-        
+
         self.active_processing_thread = KThread(target=target_function)
         self.active_processing_thread.start()
 
@@ -6240,8 +6800,15 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         progress = base * self.iteration - base
         progress += base * step
 
-        self.progress_bar_main_var.set(progress)
+        # if int(progress) >= 101:
+        #     progress = 99
+
+        self.process_update_gui_progress(progress)
+
+    def process_update_gui_progress(self, progress):
+        """Calculate the progress for the progress widget in the GUI"""
         
+        self.progress_bar_main_var.set(progress)
         self.conversion_Button_Text_var.set(f'Process Progress: {int(progress)}%')
 
     def confirm_stop_process(self):
@@ -6292,36 +6859,49 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         def time_elapsed():
             return f'Time Elapsed: {time.strftime("%H:%M:%S", time.gmtime(int(time.perf_counter() - stime)))}'
 
+        def process_failed_text():
+            self.command_Text.write(f'\n\n{PROCESS_FAILED}')
+            self.command_Text.write(time_elapsed())
+            playsound(FAIL_CHIME) if self.is_task_complete_var.get() else None
+
         def get_audio_file_base(audio_file):
             if audio_tool.audio_tool == MANUAL_ENSEMBLE:
                 return f'{os.path.splitext(os.path.basename(inputPaths[0]))[0]}'
-            elif audio_tool.audio_tool in [ALIGN_INPUTS, MATCH_INPUTS]:
+            elif audio_tool.audio_tool in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
                 return f'{os.path.splitext(os.path.basename(audio_file[0]))[0]}'
             else:
                 return f'{os.path.splitext(os.path.basename(audio_file))[0]}'
 
         def handle_ensemble(inputPaths, audio_file_base):
-            self.progress_bar_main_var.set(50)
+            self.process_update_gui_progress(50)
             if self.choose_algorithm_var.get() == COMBINE_INPUTS:
                 audio_tool.combine_audio(inputPaths, audio_file_base)
             else:
                 audio_tool.ensemble_manual(inputPaths, audio_file_base)
-            self.progress_bar_main_var.set(100)
+            self.process_update_gui_progress(100)
             self.command_Text.write(DONE)
 
         def handle_alignment_match(audio_file, audio_file_base, command_Text, set_progress_bar):
             audio_file_2_base = f'{os.path.splitext(os.path.basename(audio_file[1]))[0]}'
             if audio_tool.audio_tool == MATCH_INPUTS:
                 audio_tool.match_inputs(audio_file, audio_file_base, command_Text)
+            elif audio_tool.audio_tool == PHASE_REPAIR:
+                audio_tool.phase_repair_inputs(audio_file, audio_file_base, command_Text)
             else:
                 command_Text(f"{PROCESS_STARTING_TEXT}\n")
                 audio_tool.align_inputs(audio_file, audio_file_base, audio_file_2_base, command_Text, set_progress_bar)
-            self.progress_bar_main_var.set(base * file_num)
+            self.process_update_gui_progress(base * file_num)
             self.command_Text.write(f"{DONE}\n")
 
         def handle_pitch_time_shift(audio_file, audio_file_base):
             audio_tool.pitch_or_time_shift(audio_file, audio_file_base)
-            self.progress_bar_main_var.set(base * file_num)
+            self.process_update_gui_progress(base * file_num)
+            self.command_Text.write(DONE)
+            
+        def handle_apollo_restore(audio_file, audio_file_base, set_progress_bar):
+            #audio_tool.pitch_or_time_shift(audio_file, audio_file_base)
+            audio_tool.apollo_process(audio_file, audio_file_base, set_progress_bar)
+            self.process_update_gui_progress(base * file_num)
             self.command_Text.write(DONE)
 
         multiple_files = False
@@ -6334,9 +6914,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.iteration = 0
         self.true_model_count = 1
         self.process_check_wav_type()
+        prog_start = 2
         process_complete_text = PROCESS_COMPLETE
+        is_save_to_input_path = self.is_save_to_input_path_var.get()
+        is_manual_ensemble = False
+        is_output_path_writable = True
+        is_apollo_fail = False
 
-        if self.chosen_audio_tool_var.get() in [ALIGN_INPUTS, MATCH_INPUTS]:
+        if self.chosen_audio_tool_var.get() in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
             if self.DualBatch_inputPaths:
                 inputPaths = tuple(self.DualBatch_inputPaths)
             else:
@@ -6351,29 +6936,50 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             total_files = len(inputPaths)
             if self.chosen_audio_tool_var.get() == TIME_STRETCH:
                 audio_tool = AudioTools(TIME_STRETCH)
-                self.progress_bar_main_var.set(2)
-            elif self.chosen_audio_tool_var.get() == CHANGE_PITCH:
+                self.process_update_gui_progress(prog_start)
+            elif self.chosen_audio_tool_var.get() == CHANGE_PITCH:#
                 audio_tool = AudioTools(CHANGE_PITCH)
-                self.progress_bar_main_var.set(2)
+                self.process_update_gui_progress(prog_start)
+            elif self.chosen_audio_tool_var.get() == APOLLO_RESTORE:#
+                audio_tool = AudioTools(APOLLO_RESTORE)
+                self.process_update_gui_progress(0)
             elif self.chosen_audio_tool_var.get() == MANUAL_ENSEMBLE:
-                if self.chosen_audio_tool_var.get() == MANUAL_ENSEMBLE:
-                    audio_tool = Ensembler(is_manual_ensemble=True)
+                is_manual_ensemble = True
+                audio_tool = Ensembler(is_manual_ensemble=is_manual_ensemble)
                 multiple_files = True
                 if total_files <= 1:
                     self.command_Text.write(NOT_ENOUGH_ERROR_TEXT)
                     self.process_end()
                     return
-            elif self.chosen_audio_tool_var.get() in [ALIGN_INPUTS, MATCH_INPUTS]:
+                if can_write_to_directory(inputPaths[0]):
+                    export_dir = os.path.dirname(inputPaths[0])
+                else:
+                    is_output_path_writable = False
+                    export_dir = self.last_export_path_var.get() if can_write_to_directory(self.last_export_path_var.get()) else self.verify_default_save_path_exists()
+                self.export_path_var.set(export_dir)
+            elif self.chosen_audio_tool_var.get() in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
                 audio_tool = AudioTools(self.chosen_audio_tool_var.get())
-                self.progress_bar_main_var.set(2)
+                self.process_update_gui_progress(prog_start)
                 is_dual = True
 
             for file_num, audio_file in enumerate(inputPaths, start=1):
+                audio_tool_action = audio_tool.audio_tool
+                if is_save_to_input_path:
+                    if not is_manual_ensemble:
+                        export_dir = os.path.dirname(audio_file[0] if audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR] else audio_file)
+                        if can_write_to_directory(export_dir):
+                            export_dir = export_dir
+                        else: 
+                            is_output_path_writable = False
+                            export_dir = self.last_export_path_var.get() if can_write_to_directory(self.last_export_path_var.get()) else self.verify_default_save_path_exists()
+
+                        self.export_path_var.set(export_dir)
+                        audio_tool.main_export_path = export_dir
                 self.iteration += 1
                 base = (100 / total_files)
                 audio_file_base = get_audio_file_base(audio_file)
                 self.base_text = self.process_get_baseText(total_files=total_files, file_num=total_files if multiple_files else file_num, is_dual=is_dual)
-                command_Text = lambda text: self.command_Text.write(self.base_text + text)
+                command_Text = lambda text, new_line="": self.command_Text.write(f"{new_line}{self.base_text} {text}")
 
                 set_progress_bar = lambda step, inference_iterations=0:self.process_update_progress(total_files=total_files, step=(step + (inference_iterations)))
 
@@ -6383,12 +6989,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                         self.command_Text.write(f'\n{error_text_console}')
                     is_verified_audio = False
                     continue
-
-                audio_tool_action = audio_tool.audio_tool
-                if audio_tool_action not in [MANUAL_ENSEMBLE, ALIGN_INPUTS, MATCH_INPUTS]:
+                
+                if not is_output_path_writable:
+                    self.command_Text.write(f'{self.base_text}: {INPUT_DIR_FAIL_TEXT}')
+                    
+                if audio_tool_action not in [MANUAL_ENSEMBLE, ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
                     audio_file = self.create_sample(audio_file) if is_model_sample_mode else audio_file
                     self.command_Text.write(f'{NEW_LINE if file_num != 1 else NO_LINE}{self.base_text}"{os.path.basename(audio_file)}\".{NEW_LINES}')
-                elif audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS]:
+                elif audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
                     text_write = ("File 1", "File 2") if audio_tool_action == ALIGN_INPUTS else ("Target", "Reference")
                     if audio_file[0] != audio_file[1]:
                         self.command_Text.write(f'{self.base_text}{text_write[0]}:  "{os.path.basename(audio_file[0])}"{NEW_LINE}')
@@ -6403,25 +7011,40 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     
                 is_verified_audio = True
 
-                if not audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS]:
+                if not audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
                     command_Text(PROCESS_STARTING_TEXT)
 
                 if audio_tool_action == MANUAL_ENSEMBLE:
                     handle_ensemble(inputPaths, audio_file_base)
                     break
-                if audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS]:
+                if audio_tool_action in [ALIGN_INPUTS, MATCH_INPUTS, PHASE_REPAIR]:
                     process_complete_text = PROCESS_COMPLETE_2
                     handle_alignment_match(audio_file, audio_file_base, command_Text, set_progress_bar)
                 if audio_tool_action in [TIME_STRETCH, CHANGE_PITCH]:
                     handle_pitch_time_shift(audio_file, audio_file_base)
+                if audio_tool_action == APOLLO_RESTORE:
+                    
+                    if not audio_tool.is_apollo_model:
+                        if audio_tool.apollo_model == CHOOSE_MODEL:
+                            command_Text("Please choose a model!", "\n")
+                        else:
+                            command_Text(f"{audio_tool.apollo_model} is not a valid model.", "\n")
+                            process_failed_text()
+
+                        is_apollo_fail = True
+
+                        break
+                    
+                    handle_apollo_restore(audio_file, audio_file_base, set_progress_bar)
 
             if total_files == 1 and not is_verified_audio:
                 self.command_Text.write(f'{error_text_console}\n{PROCESS_FAILED}')
                 self.command_Text.write(time_elapsed())
                 playsound(FAIL_CHIME) if self.is_task_complete_var.get() else None
             else:
-                self.command_Text.write('{}{}'.format(process_complete_text, time_elapsed()))
-                playsound(COMPLETE_CHIME) if self.is_task_complete_var.get() else None
+                if not is_apollo_fail:
+                    self.command_Text.write('{}{}'.format(process_complete_text, time_elapsed()))
+                    playsound(COMPLETE_CHIME) if self.is_task_complete_var.get() else None
 
             self.process_end()
 
@@ -6557,6 +7180,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         inputPaths = self.inputPaths
         inputPath_total_len = len(inputPaths)
         is_model_sample_mode = self.model_sample_mode_var.get()
+        is_save_to_input_path = self.is_save_to_input_path_var.get()
         
         try:
             if self.chosen_process_method_var.get() == ENSEMBLE_MODE:
@@ -6575,12 +7199,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             true_model_pre_proc_model_count = sum(2 if m.pre_proc_model_activated else 0 for m in model)
             self.true_model_count = sum(2 if m.is_secondary_model_activated else 1 for m in model) + true_model_4_stem_count + true_model_pre_proc_model_count + self.determine_voc_split(model)
 
-            #print("self.true_model_count", self.true_model_count)
-
             for file_num, audio_file in enumerate(inputPaths, start=1):
                 self.cached_sources_clear()
                 base_text = self.process_get_baseText(total_files=inputPath_total_len, file_num=file_num)
-
+                audiofile_path = os.path.dirname(audio_file)
+                
                 if self.verify_audio(audio_file):
                     audio_file = self.create_sample(audio_file) if is_model_sample_mode else audio_file
                     self.command_Text.write(f'{NEW_LINE if not file_num ==1 else NO_LINE}{base_text}"{os.path.basename(audio_file)}\".{NEW_LINES}')
@@ -6591,6 +7214,17 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     self.iteration += self.true_model_count
                     is_verified_audio = False
                     continue
+
+                if is_save_to_input_path:
+                    if not can_write_to_directory(audiofile_path):
+                        audiofile_path = self.last_export_path_var.get() if can_write_to_directory(self.last_export_path_var.get()) else self.verify_default_save_path_exists()
+                        self.command_Text.write(base_text + f'{INPUT_DIR_FAIL_TEXT}')
+
+                    export_path = audiofile_path
+                    self.export_path_var.set(export_path)
+
+                    if is_ensemble:
+                        export_path = ensemble.save_to_input_dir_ensemble(export_path)
 
                 for current_model_num, current_model in enumerate(model, start=1):
                     self.iteration += 1
@@ -6612,7 +7246,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
 
                     if self.is_create_model_folder_var.get() and not is_ensemble:
                         export_path = os.path.join(Path(self.export_path_var.get()), current_model.model_basename, os.path.splitext(os.path.basename(audio_file))[0])
-                        if not os.path.isdir(export_path):os.makedirs(export_path) 
+                        if not os.path.isdir(export_path):
+                            os.makedirs(export_path) 
 
                     process_data = {
                                     'model_data': current_model, 
@@ -6664,7 +7299,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     
                 clear_gpu_cache()
                 
-            shutil.rmtree(export_path) if is_ensemble and len(os.listdir(export_path)) == 0 else None
+            if is_ensemble and len(os.listdir(export_path)) == 0:
+                shutil.rmtree(export_path)
 
             if inputPath_total_len == 1 and not is_verified_audio:
                 self.command_Text.write(f'{error_text_console}\n{PROCESS_FAILED}')
@@ -6721,6 +7357,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             if not key in data.keys():
                 data = {**data, **{key:value}}
                 data['batch_size'] = DEF_OPT
+                data['is_mdx_c_seg_def'] = True
 
         ## ADD_BUTTON
         self.chosen_process_method_var = tk.StringVar(value=data['chosen_process_method'])
@@ -6834,7 +7471,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.is_accept_any_input_var = tk.BooleanVar(value=data['is_accept_any_input'])
         self.is_task_complete_var = tk.BooleanVar(value=data['is_task_complete'])
         self.is_normalization_var = tk.BooleanVar(value=data['is_normalization'])#
-        self.is_use_opencl_var = tk.BooleanVar(value=False)#True if is_opencl_only else data['is_use_opencl'])#
+        self.is_use_directml_var = tk.BooleanVar(value=True if is_directml_only else data['is_use_directml'])#
         self.is_wav_ensemble_var = tk.BooleanVar(value=data['is_wav_ensemble'])#
         self.is_create_model_folder_var = tk.BooleanVar(value=data['is_create_model_folder'])
         self.help_hints_var = tk.BooleanVar(value=data['help_hints_var'])
@@ -6845,8 +7482,10 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.set_vocal_splitter_var = tk.StringVar(value=data['set_vocal_splitter'])
         self.is_set_vocal_splitter_var = tk.BooleanVar(value=data['is_set_vocal_splitter'])#
         self.is_save_inst_set_vocal_splitter_var = tk.BooleanVar(value=data['is_save_inst_set_vocal_splitter'])#
+        self.is_save_to_input_path_var = tk.BooleanVar(value=data['is_save_to_input_path'])#
         
         #Path Vars
+        self.last_export_path_var = tk.StringVar(value=data['last_export_path'])
         self.export_path_var = tk.StringVar(value=data['export_path'])
         self.inputPaths = data['input_paths']
         self.lastDir = data['lastDir']
@@ -6856,11 +7495,22 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.intro_analysis_var = tk.StringVar(value=data['intro_analysis'])
         self.db_analysis_var = tk.StringVar(value=data['db_analysis'])
         
+        #Phase-Swap
+        self.phase_low_cutoff_var = tk.StringVar(value=data['phase_low_cutoff'])#
+        self.phase_high_cutoff_var = tk.StringVar(value=data['phase_high_cutoff'])
+        #self.phase_mag_option_var = tk.StringVar(value=data['db_analysis'])
+        
         self.fileOneEntry_var = tk.StringVar(value=data['fileOneEntry'])
         self.fileOneEntry_Full_var = tk.StringVar(value=data['fileOneEntry_Full'])
         self.fileTwoEntry_var = tk.StringVar(value=data['fileTwoEntry'])
         self.fileTwoEntry_Full_var = tk.StringVar(value=data['fileTwoEntry_Full'])
         self.DualBatch_inputPaths = data['DualBatch_inputPaths']
+        
+        #Apollo Restore
+        
+        self.apollo_overlap_var = tk.StringVar(value=data['apollo_overlap'])
+        self.apollo_chunk_size_var = tk.StringVar(value=data['apollo_chunk_size'])
+        self.apollo_model_var = tk.StringVar(value=data['apollo_model'])
    
     def load_saved_settings(self, loaded_setting: dict, process_method=None, is_default_reset=False):
         """Loads user saved application settings or resets to default"""
@@ -6869,6 +7519,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             if not key in loaded_setting.keys():
                 loaded_setting = {**loaded_setting, **{key:value}}
                 loaded_setting['batch_size'] = DEF_OPT
+                loaded_setting['is_mdx_c_seg_def'] = True
                 
         is_default_reset = True if process_method == ENSEMBLE_MODE or is_default_reset else False
         
@@ -6960,6 +7611,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.is_auto_update_model_params_var.set(loaded_setting['is_auto_update_model_params'])
             self.is_add_model_name_var.set(loaded_setting['is_add_model_name'])
             self.is_accept_any_input_var.set(loaded_setting["is_accept_any_input"])
+            self.is_save_to_input_path_var.set(loaded_setting["is_save_to_input_path"])
+            self.last_export_path_var.set(loaded_setting["last_export_path"])
             self.is_task_complete_var.set(loaded_setting['is_task_complete'])
             self.is_create_model_folder_var.set(loaded_setting['is_create_model_folder'])
             self.mp3_bit_set_var.set(loaded_setting['mp3_bit_set'])
@@ -6972,6 +7625,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.phase_shifts_var.set(loaded_setting['phase_shifts'])#
             self.is_save_align_var.set(loaded_setting['is_save_align'])#i
             self.time_window_var.set(loaded_setting['time_window'])#
+            self.phase_low_cutoff_var.set(loaded_setting['phase_low_cutoff'])#
+            self.phase_high_cutoff_var.set(loaded_setting['phase_high_cutoff'])            
             self.is_match_silence_var.set(loaded_setting['is_match_silence'])#
             self.is_spec_match_var.set(loaded_setting['is_spec_match'])#
             self.intro_analysis_var.set(loaded_setting['intro_analysis'])#
@@ -6984,7 +7639,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             
         self.is_gpu_conversion_var.set(loaded_setting['is_gpu_conversion'])
         self.is_normalization_var.set(loaded_setting['is_normalization'])#
-        self.is_use_opencl_var.set(False)#True if is_opencl_only else loaded_setting['is_use_opencl'])#
+        self.is_use_directml_var.set(True if is_directml_only else loaded_setting['is_use_directml'])#
         self.is_wav_ensemble_var.set(loaded_setting['is_wav_ensemble'])#
         self.help_hints_var.set(loaded_setting['help_hints_var'])
         self.is_wav_ensemble_var.set(loaded_setting['is_wav_ensemble'])
@@ -6994,6 +7649,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.deverb_vocal_opt_var.set(loaded_setting['deverb_vocal_opt'])#
         self.voc_split_save_opt_var.set(loaded_setting['voc_split_save_opt'])#
         self.is_deverb_vocals_var.set(loaded_setting['is_deverb_vocals'])#
+        
+        self.apollo_overlap_var.set(loaded_setting['apollo_overlap'])
+        self.apollo_chunk_size_var.set(loaded_setting['apollo_chunk_size'])
+        self.apollo_model_var.set(loaded_setting['apollo_model'])
+        
         
         self.model_sample_mode_var.set(loaded_setting['model_sample_mode'])
         self.model_sample_mode_duration_var.set(loaded_setting['model_sample_mode_duration'])
@@ -7093,9 +7753,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             'is_auto_update_model_params': self.is_auto_update_model_params_var.get(),
             'is_add_model_name': self.is_add_model_name_var.get(),
             'is_accept_any_input': self.is_accept_any_input_var.get(),
+            'is_save_to_input_path': self.is_save_to_input_path_var.get(),
+            #is_save_to_input_path
+            'apollo_overlap': self.apollo_overlap_var.get(),
+            'apollo_chunk_size': self.apollo_chunk_size_var.get(),
+            'apollo_model': self.apollo_model_var.get(),
             'is_task_complete': self.is_task_complete_var.get(),
             'is_normalization': self.is_normalization_var.get(),#
-            'is_use_opencl': self.is_use_opencl_var.get(),#
+            'is_use_directml': self.is_use_directml_var.get(),#
             'is_wav_ensemble': self.is_wav_ensemble_var.get(),#
             'is_create_model_folder': self.is_create_model_folder_var.get(),
             'mp3_bit_set': self.mp3_bit_set_var.get(),
@@ -7113,11 +7778,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             }
 
         other_data = {
+            'last_export_path': self.last_export_path_var.get(),
             'chosen_process_method': self.chosen_process_method_var.get(),
             'input_paths': self.inputPaths,
             'lastDir': self.lastDir,
             'export_path': self.export_path_var.get(),
             'time_window': self.time_window_var.get(),
+            'phase_low_cutoff': self.phase_low_cutoff_var.get(),
+            'phase_high_cutoff': self.phase_high_cutoff_var.get(),   
             'intro_analysis': self.intro_analysis_var.get(),
             'db_analysis': self.db_analysis_var.get(),
             'fileOneEntry': self.fileOneEntry_var.get(),

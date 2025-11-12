@@ -132,9 +132,9 @@ class ImagePath():
         if size is not None:
             size = (int(size[0]), int(size[1]))
             if keep_aspect:
-                img = img.resize((size[0], int(size[0] * ratio)), Image.ANTIALIAS)
+                img = img.resize((size[0], int(size[0] * ratio)), Image.LANCZOS)
             else:
-                img = img.resize(size, Image.ANTIALIAS)
+                img = img.resize(size, Image.LANCZOS)
                 
         return ImageTk.PhotoImage(img)
 
@@ -239,7 +239,7 @@ WIDTH = determined_size["WIDTH"]
 # WIDTH = 680
 
 MENU_PADDING_1 = 3
-MENU_PADDING_2 = 10
+MENU_PADDING_2 = 9
 MENU_PADDING_3 = 15
 MENU_PADDING_4 = 3
 
@@ -300,8 +300,8 @@ INTRO_ANALYSIS_OPTION_X = -68
 DB_ANALYSIS_LABEL_X = 62
 DB_ANALYSIS_LABEL_WIDTH = -34
 DB_ANALYSIS_OPTION_X = 86
-WAV_TYPE_SET_LABEL_X = -43
-WAV_TYPE_SET_LABEL_WIDTH = 0
+WAV_TYPE_SET_LABEL_X = -40
+WAV_TYPE_SET_LABEL_WIDTH = -12
 ENTRY_WIDTH = 222
 
 # Constants for the ensemble_listbox_Frame
@@ -311,10 +311,16 @@ ENSEMBLE_LISTBOX_FRAME_WIDTH = 0
 ENSEMBLE_LISTBOX_FRAME_HEIGHT = 67
 
 # Constants for the ensemble_listbox_scroll
-ENSEMBLE_LISTBOX_SCROLL_X = 195
-ENSEMBLE_LISTBOX_SCROLL_Y = -20
-ENSEMBLE_LISTBOX_SCROLL_WIDTH = -48
-ENSEMBLE_LISTBOX_SCROLL_HEIGHT = 69
+ENSEMBLE_LISTBOX_SCROLL_X = 196
+ENSEMBLE_LISTBOX_SCROLL_Y = -22
+ENSEMBLE_LISTBOX_SCROLL_WIDTH = -55
+ENSEMBLE_LISTBOX_SCROLL_HEIGHT = 71
+
+# Constants for the ensemble_listbox_scroll
+ENSEMBLE_LISTBOX_HSCROLL_X = 195
+ENSEMBLE_LISTBOX_HSCROLL_Y = -20
+ENSEMBLE_LISTBOX_HSCROLL_WIDTH = -48
+ENSEMBLE_LISTBOX_HSCROLL_HEIGHT = 69
 
 # Constants for Radio Buttons
 RADIOBUTTON_X_WAV = 457
@@ -355,6 +361,9 @@ LOW_MENU_Y = LOW_MENU_Y_1, LOW_MENU_Y_2
 MAIN_ROW_Y = MAIN_ROW_Y_1, MAIN_ROW_Y_2
 MAIN_ROW_X = MAIN_ROW_X_1, MAIN_ROW_X_2
 MAIN_ROW_2_Y = MAIN_ROW_2_Y_1, MAIN_ROW_2_Y_2
+MAIN_ROW_2_X = MAIN_ROW_2_X_1, MAIN_ROW_2_X_2
+
+
 MAIN_ROW_2_X = MAIN_ROW_2_X_1, MAIN_ROW_2_X_2
 
 LABEL_Y = MAIN_ROW_Y[0]

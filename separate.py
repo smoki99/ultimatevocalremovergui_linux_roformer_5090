@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
+import sys
 from demucs.apply import apply_model, demucs_segments
 from demucs.hdemucs import HDemucs
 from demucs.model_v2 import auto_load_demucs_model_v2
@@ -11,6 +12,9 @@ from lib_v5 import spec_utils
 from lib_v5.vr_network import nets
 from lib_v5.vr_network import nets_new
 from lib_v5.vr_network.model_param_init import ModelParameters
+from lib_v5.mel_band_roformer import MelBandRoformer
+from lib_v5.bs_roformer import BSRoformer
+#from lib_v5.scnet.scnet import SCNet
 from pathlib import Path
 from gui_data.constants import *
 from gui_data.error_handling import *
@@ -23,37 +27,46 @@ import numpy as np
 import onnxruntime as ort
 import os
 import torch
+import torch.nn as nn
 import warnings
 import pydub
 import soundfile as sf
 import lib_v5.mdxnet as MdxnetSet
 import math
+import time
 #import random
 from onnx import load
 from onnx2pytorch import ConvertModel
 import gc
- 
+
 if TYPE_CHECKING:
     from UVR import ModelData
 
-# if not is_macos:
-#     import torch_directml
+# DirectML is Windows-only
+if not is_macos and sys.platform == "win32":
+    try:
+        import torch_directml # type:ignore
+    except ImportError:
+        pass  # DirectML not available on this platform
 
 mps_available = torch.backends.mps.is_available() if is_macos else False
 cuda_available = torch.cuda.is_available()
+default_sr = 44100
 
-# def get_gpu_info():
-#     directml_device, directml_available = DIRECTML_DEVICE, False
+def get_gpu_info():
+    directml_device, directml_available = DIRECTML_DEVICE, False
     
-#     if not is_macos:
-#         directml_available = torch_directml.is_available()
+    if not is_macos and sys.platform == "win32":
+        try:
+            directml_available = torch_directml.is_available() # type: ignore
+            if directml_available:
+                directml_device = str(torch_directml.device()).partition(":")[0] # type: ignore
+        except (ImportError, NameError):
+            pass  # DirectML not available
 
-#         if directml_available:
-#             directml_device = str(torch_directml.device()).partition(":")[0]
+    return directml_device, directml_available
 
-#     return directml_device, directml_available
-
-# DIRECTML_DEVICE, directml_available = get_gpu_info()
+DIRECTML_DEVICE, directml_available = get_gpu_info()
 
 def clear_gpu_cache():
     gc.collect()
@@ -128,9 +141,11 @@ class SeperateAttributes:
         self.primary_model_primary_stem = model_data.primary_model_primary_stem
         self.primary_stem_native = model_data.primary_stem_native
         self.primary_stem = model_data.primary_stem #
+        print(self.primary_stem)
         self.secondary_stem = model_data.secondary_stem #
         self.is_invert_spec = model_data.is_invert_spec #
         self.is_deverb_vocals = model_data.is_deverb_vocals
+        self.is_target_instrument = model_data.is_target_instrument
         self.is_mixer_mode = model_data.is_mixer_mode #
         self.secondary_model_scale = model_data.secondary_model_scale #
         self.is_demucs_pre_proc_model_inst_mix = model_data.is_demucs_pre_proc_model_inst_mix #
@@ -166,10 +181,14 @@ class SeperateAttributes:
         self.is_save_vocal_only = model_data.is_save_vocal_only
         self.device = cpu
         self.run_type = ['CPUExecutionProvider']
-        self.is_opencl = False
+        self.is_using_directml = False
         self.device_set = model_data.device_set
-        self.is_use_opencl = model_data.is_use_opencl
-        
+        self.is_use_directml = model_data.is_use_directml
+        #Roformer
+        self.roformer_config = model_data.mdx_c_configs
+        self.is_roformer = model_data.is_roformer
+        self.overwrite_protect_stamp = round(time.time())
+
         if self.is_inst_only_voc_splitter or self.is_sec_bv_rebalance:
             self.is_primary_stem_only = False
             self.is_secondary_stem_only = False
@@ -183,12 +202,16 @@ class SeperateAttributes:
             else:
                 device_prefix = None
                 if self.device_set != DEFAULT:
-                    device_prefix = CUDA_DEVICE#DIRECTML_DEVICE if self.is_use_opencl and directml_available else CUDA_DEVICE
+                    device_prefix = DIRECTML_DEVICE if self.is_use_directml and directml_available else CUDA_DEVICE
 
-                # if directml_available and self.is_use_opencl:
-                #     self.device = torch_directml.device() if not device_prefix else f'{device_prefix}:{self.device_set}'
-                #     self.is_other_gpu = True
-                if cuda_available:# and not self.is_use_opencl:
+                if directml_available and self.is_use_directml:
+                    try:
+                        self.device = torch_directml.device() if not device_prefix else f'{device_prefix}:{self.device_set}' # type: ignore
+                    except NameError:
+                        self.device = 'cpu'  # Fallback if DirectML not available
+                    self.is_other_gpu = True
+                    self.is_using_directml = True
+                elif cuda_available and not self.is_use_directml:
                     self.device = CUDA_DEVICE if not device_prefix else f'{device_prefix}:{self.device_set}'
                     self.run_type = ['CUDAExecutionProvider']
 
@@ -204,8 +227,9 @@ class SeperateAttributes:
             
             if self.is_mdx_c:
                 if not self.is_4_stem_ensemble:
-                    self.primary_stem = model_data.ensemble_primary_stem if process_data['is_ensemble_master'] else model_data.primary_stem
-                    self.secondary_stem = model_data.ensemble_secondary_stem if process_data['is_ensemble_master'] else model_data.secondary_stem
+                    if not self.is_target_instrument:
+                        self.primary_stem = model_data.ensemble_primary_stem if process_data['is_ensemble_master'] else model_data.primary_stem
+                        self.secondary_stem = model_data.ensemble_secondary_stem if process_data['is_ensemble_master'] else model_data.secondary_stem
             else:
                 self.dim_f, self.dim_t = model_data.mdx_dim_f_set, 2**model_data.mdx_dim_t_set
                 
@@ -276,13 +300,10 @@ class SeperateAttributes:
                                    'aggr_correction': self.mp.param.get('aggr_correction')}
             
     def check_label_secondary_stem_runs(self):
-
-        # For ensemble master that's not a 4-stem ensemble, and not mdx_c
-        if self.process_data['is_ensemble_master'] and not self.is_4_stem_ensemble and not self.is_mdx_c:
+        if (self.process_data['is_ensemble_master'] and not self.is_4_stem_ensemble and not self.is_mdx_c) or (self.process_data['is_ensemble_master'] and self.is_target_instrument):
             if self.ensemble_primary_stem != self.primary_stem:
-                self.is_primary_stem_only, self.is_secondary_stem_only = self.is_secondary_stem_only, self.is_primary_stem_only
-            
-        # For secondary models
+                self.is_primary_stem_only, self.is_secondary_stem_only = self.is_secondary_stem_only, self.is_primary_stem_only   
+
         if self.is_pre_proc_model or self.is_secondary_model:
             self.is_primary_stem_only = False
             self.is_secondary_stem_only = False
@@ -313,6 +334,10 @@ class SeperateAttributes:
     def running_inference_progress_bar(self, length, is_match_mix=False):
         if not is_match_mix:
             self.progress_value += 1
+
+            # Avoid division by zero
+            if length <= 0:
+                length = 1
 
             if (0.8/length*self.progress_value) >= 0.8:
                 length = self.progress_value + 1
@@ -385,8 +410,12 @@ class SeperateAttributes:
     
     def write_audio(self, stem_path: str, stem_source, samplerate, stem_name=None):
         
-        def save_audio_file(path, source):
+        def save_audio_file(path: str, source):
             source = spec_utils.normalize(source, self.is_normalization)
+
+            if os.path.isfile(path) and is_not_ensemble:
+                path = path.replace(".wav", f"_{self.overwrite_protect_stamp}.wav")
+
             sf.write(path, source, samplerate, subtype=self.wav_type_set)
 
             if is_not_ensemble:
@@ -639,6 +668,7 @@ class SeperateMDX(SeperateAttributes):
 class SeperateMDXC(SeperateAttributes):        
 
     def seperate(self):
+        self.is_vocal_main_target = True if self.mdx_c_configs.training.target_instrument == VOCAL_STEM else False
         samplerate = 44100
         sources = None
 
@@ -654,7 +684,7 @@ class SeperateMDXC(SeperateAttributes):
                 self.cache_source((mix, sources))
             self.write_to_console(DONE, base_text='')
 
-        stem_list = [self.mdx_c_configs.training.target_instrument] if self.mdx_c_configs.training.target_instrument else [i for i in self.mdx_c_configs.training.instruments]
+        stem_list = [self.mdx_c_configs.training.target_instrument] if self.mdx_c_configs.training.target_instrument and not self.is_vocal_main_target else [i for i in self.mdx_c_configs.training.instruments]
 
         if self.is_secondary_model:
             if self.is_pre_proc_model:
@@ -680,10 +710,15 @@ class SeperateMDXC(SeperateAttributes):
                 if stem == VOCAL_STEM and not self.is_sec_bv_rebalance:
                     self.process_vocal_split_chain({VOCAL_STEM:stem})
         else:
+            print(stem_list)
             if len(stem_list) == 1:
                 source_primary = sources  
             else:
-                source_primary = sources[stem_list[0]] if self.is_multi_stem_ensemble and len(stem_list) == 2 else sources[self.mdxnet_stem_select]
+                if self.is_multi_stem_ensemble or len(stem_list) == 2:
+                    source_primary = sources[stem_list[0]]
+                else: 
+                    sources[self.mdxnet_stem_select]
+                
             if self.is_secondary_model_activated and self.secondary_model:
                 self.secondary_source_primary, self.secondary_source_secondary = process_secondary_model(self.secondary_model, 
                                                                                                          self.process_data, 
@@ -731,57 +766,125 @@ class SeperateMDXC(SeperateAttributes):
         if self.is_secondary_model or self.is_pre_proc_model:
             return secondary_sources
 
+    def overlap_add(self, result, x, l, j, start, window):
+        if self.device == 'mps' or self.is_other_gpu:
+            x = x.to(self.device)
+        result[..., start:start + l] += x[j][..., :l] * window[..., :l]
+        return result
+
     def demix(self, mix):
         sr_pitched = 441000
         org_mix = mix
         if self.is_pitch_change:
             mix, sr_pitched = spec_utils.change_pitch_semitones(mix, 44100, semitone_shift=-self.semitone_shift)
 
-        model = TFC_TDF_net(self.mdx_c_configs, device=self.device)
-        model.load_state_dict(torch.load(self.model_path, map_location=cpu))
-        model.to(self.device).eval()
+        device = self.device
+
+        # Determine the model type based on the configuration and instantiate it
+        if self.is_roformer:
+            if 'num_bands' in self.roformer_config.model:
+                model = MelBandRoformer(**self.roformer_config.model)
+            elif 'freqs_per_bands' in self.roformer_config.model:
+                model = BSRoformer(**self.roformer_config.model)
+            # elif 'bandsplit_ratios' in self.roformer_config.model:
+            #     #print("**self.roformer_config.model", f"{self.roformer_config.model}")
+            #     model = SCNet(**self.roformer_config.model)
+            else:
+                raise ValueError('Unknown model type in the configuration.')
+        else:
+            model = TFC_TDF_net(self.mdx_c_configs, device=self.device)
+
+        # Load model checkpoint
+        checkpoint = torch.load(self.model_path, map_location='cpu')
+        model = model if not isinstance(model, torch.nn.DataParallel) else model.module
+        model.load_state_dict(checkpoint)
+        model.to(device).eval()
         mix = torch.tensor(mix, dtype=torch.float32)
 
-        try:
-            S = model.num_target_instruments
-        except Exception as e:
-            S = model.module.num_target_instruments
+        segment_size = self.mdx_c_configs.inference.dim_t if self.is_mdx_c_seg_def else self.mdx_segment_size
+        S = 1 if self.roformer_config.training.target_instrument else len(self.roformer_config.training.instruments)
+        C = self.roformer_config.audio.hop_length * (segment_size - 1)
+        N = self.overlap_mdx23
+        step = int(C // N)
+        fade_size = C // 10
+        batch_size = self.roformer_config.inference.batch_size
+        length_init = mix.shape[-1]
 
-        mdx_segment_size = self.mdx_c_configs.inference.dim_t if self.is_mdx_c_seg_def else self.mdx_segment_size
-        
-        batch_size = self.mdx_batch_size
-        chunk_size = self.mdx_c_configs.audio.hop_length * (mdx_segment_size - 1)
-        overlap = self.overlap_mdx23
+        # Padding the mix to account for border effects
+        if length_init > 2 * (C - step) and (C - step > 0):
+            mix = nn.functional.pad(mix, (C - step, C - step), mode='reflect')
 
-        hop_size = chunk_size // overlap
-        mix_shape = mix.shape[1]
-        pad_size = hop_size - (mix_shape - chunk_size) % hop_size
-        mix = torch.cat([torch.zeros(2, chunk_size - hop_size), mix, torch.zeros(2, pad_size + chunk_size - hop_size)], 1)
+        # Set up windows for fade-in/out
+        fadein = torch.linspace(0, 1, fade_size).to(device)
+        fadeout = torch.linspace(1, 0, fade_size).to(device)
+        window_start = torch.ones(C).to(device)
+        window_middle = torch.ones(C).to(device)
+        window_finish = torch.ones(C).to(device)
+        window_start[-fade_size:] *= fadeout  # No fade-in at start
+        window_finish[:fade_size] *= fadein  # No fade-out at end
+        window_middle[:fade_size] *= fadein
+        window_middle[-fade_size:] *= fadeout
 
-        chunks = mix.unfold(1, chunk_size, hop_size).transpose(0, 1)
-        batches = [chunks[i : i + batch_size] for i in range(0, len(chunks), batch_size)]
-        
-        X = torch.zeros(S, *mix.shape) if S > 1 else torch.zeros_like(mix)
-        X = X.to(self.device)
+        batch_len = int(mix.shape[1] / step)
 
-        with torch.no_grad():
-            cnt = 0
-            for batch in batches:
-                self.running_inference_progress_bar(len(batches))
-                x = model(batch.to(self.device))
+        with torch.no_grad() if self.is_using_directml else torch.inference_mode():
+            req_shape = (S, ) + tuple(mix.shape)
+            result = torch.zeros(req_shape, dtype=torch.float32, device=device)
+            counter = torch.zeros(req_shape, dtype=torch.float32, device=device)
+            batch_data = []
+            batch_locations = []
+
+            i = 0
+
+            while i < mix.shape[1]:
+                part = mix[:, i:i + C].to(device)
+                length = part.shape[-1]
+                if length < C:
+                    if length > C // 2 + 1:
+                        part = nn.functional.pad(part, (0, C - length), mode='reflect')
+                    else:
+                        part = nn.functional.pad(part, (0, C - length, 0, 0), mode='constant', value=0)
                 
-                for w in x:
-                    X[..., cnt * hop_size : cnt * hop_size + chunk_size] += w
-                    cnt += 1
+                batch_data.append(part)
+                batch_locations.append((i, length))
+                i += step
 
-        estimated_sources = X[..., chunk_size - hop_size:-(pad_size + chunk_size - hop_size)] / overlap
-        del X
+                # Process in batches
+                if len(batch_data) >= batch_size or (i >= mix.shape[1]):
+                    arr = torch.stack(batch_data, dim=0)
+                    x = model(arr)
+
+                    for j in range(len(batch_locations)):
+                        self.running_inference_progress_bar(batch_len)
+                        start, l = batch_locations[j]
+                        window = window_middle
+                        if start == 0:
+                            window = window_start
+                        elif i >= mix.shape[1]:
+                            window = window_finish
+
+                        result = self.overlap_add(result, x, l, j, start, window)
+                        counter[..., start:start + l] += window[..., :l]
+
+                    batch_data = []
+                    batch_locations = []
+
+            # Normalize by the overlap counter and remove padding
+            estimated_sources = result / counter.clamp(min=1e-10)
+
+            if length_init > 2 * (C - step) and (C - step > 0):
+                estimated_sources = estimated_sources[..., (C - step):-(C - step)]
+
         pitch_fix = lambda s:self.pitch_fix(s, sr_pitched, org_mix)
 
-        if S > 1:
+        if S > 1 or self.is_vocal_main_target:
             sources = {k: pitch_fix(v) if self.is_pitch_change else v for k, v in zip(self.mdx_c_configs.training.instruments, estimated_sources.cpu().detach().numpy())}
-            del estimated_sources
-            if self.is_denoise_model:
+            if self.is_vocal_main_target:
+                if sources[VOCAL_STEM].shape[1] != org_mix.shape[1]:
+                    sources[VOCAL_STEM] = spec_utils.match_array_shapes(sources[VOCAL_STEM], org_mix)
+                sources[INST_STEM] = org_mix - sources[VOCAL_STEM]
+                
+            if self.is_denoise_model and not self.is_roformer:
                 if VOCAL_STEM in sources.keys() and INST_STEM in sources.keys():
                     sources[VOCAL_STEM] = vr_denoiser(sources[VOCAL_STEM], self.device, model_path=self.DENOISER_MODEL)
                     if sources[VOCAL_STEM].shape[1] != org_mix.shape[1]:
@@ -790,8 +893,12 @@ class SeperateMDXC(SeperateAttributes):
                             
             return sources
         else:
-            est_s = estimated_sources.cpu().detach().numpy()
-            del estimated_sources
+            if self.is_roformer:
+                sources = {k: v.cpu().detach().numpy() for k, v in zip([self.mdx_c_configs.training.target_instrument], estimated_sources)}
+                est_s = sources[self.mdx_c_configs.training.target_instrument]
+            else:
+                est_s = estimated_sources.cpu().detach().numpy()
+
             return pitch_fix(est_s) if self.is_pitch_change else est_s
 
 class SeperateDemucs(SeperateAttributes):
