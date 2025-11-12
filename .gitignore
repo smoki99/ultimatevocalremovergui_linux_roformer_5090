@@ -21,6 +21,9 @@ models/
 temp_sample_clips/
 ensemble_temps/
 
+# User data (runtime-generated)
+data.pkl
+
 # IDE
 .vscode/
 .idea/

@@ -12,6 +12,9 @@ def file_check(original_dir, new_dir):
             
 def remove_unneeded_yamls(demucs_dir):
     
+    if not os.path.isdir(demucs_dir):
+        return
+    
     for file in os.listdir(demucs_dir):
         if file.endswith('.yaml'):
             if os.path.isfile(os.path.join(demucs_dir, file)):

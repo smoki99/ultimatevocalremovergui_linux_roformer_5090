@@ -202,8 +202,13 @@ def load_data() -> dict:
 
 def load_model_hash_data(dictionary):
     '''Get the model hash dictionary'''
-    with open(dictionary, 'r') as d:
-        return json.load(d)
+    try:
+        with open(dictionary, 'r') as d:
+            return json.load(d)
+    except (FileNotFoundError, json.JSONDecodeError):
+        # Model data file doesn't exist yet or is corrupted
+        # Will be created when models are downloaded
+        return {}
 
 def font_checker(font_file):
     chosen_font_name = None
@@ -306,6 +311,12 @@ DEVERBER_MODEL_PATH = os.path.join(VR_MODELS_DIR, 'UVR-DeEcho-DeReverb.pth')
 
 MODEL_DATA_URLS = [VR_MODEL_DATA_LINK, MDX_MODEL_DATA_LINK, MDX_MODEL_NAME_DATA_LINK, DEMUCS_MODEL_NAME_DATA_LINK]
 MODEL_DATA_FILES = [VR_HASH_JSON, MDX_HASH_JSON, MDX_MODEL_NAME_SELECT, DEMUCS_MODEL_NAME_SELECT]
+
+# Create model directories if they don't exist
+for model_dir in [VR_MODELS_DIR, MDX_MODELS_DIR, DEMUCS_MODELS_DIR, DEMUCS_NEWER_REPO_DIR, 
+                  APOLLO_MODELS_DIR, VR_HASH_DIR, MDX_HASH_DIR]:
+    if not os.path.isdir(model_dir):
+        os.makedirs(model_dir, exist_ok=True)
 
 file_check(os.path.join(MODELS_DIR, 'Main_Models'), VR_MODELS_DIR)
 file_check(os.path.join(DEMUCS_MODELS_DIR, 'v3_repo'), DEMUCS_NEWER_REPO_DIR)
@@ -2624,6 +2635,9 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
     def get_files_from_dir(self, directory, ext, is_mdxnet=False, is_apollo=False):
         """Gets files from specified directory that ends with specified extention"""
+        
+        if not os.path.isdir(directory):
+            return tuple()
         
         if is_apollo:
             return tuple(
