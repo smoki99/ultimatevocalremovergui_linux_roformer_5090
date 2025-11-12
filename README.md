@@ -24,10 +24,31 @@ Based on [Anjok07/ultimatevocalremovergui v5.6.0](https://github.com/Anjok07/ult
 ### Prerequisites
 - **OS:** Ubuntu 22.04+ or compatible Debian-based Linux
 - **GPU:** NVIDIA GPU with CUDA support (tested on RTX 5090 Ti with 32GB VRAM)
-- **Python:** 3.12.x
+- **Python:** 3.10+ (tested on 3.12.3)
 - **System packages:** `ffmpeg`, `python3-pip`, `python3-tk`, `python3-venv`
 
-### Installation
+### Automated Installation (Recommended)
+
+1. **Install system dependencies:**
+   ```bash
+   sudo apt update && sudo apt upgrade -y
+   sudo apt install -y ffmpeg python3-pip python3-tk python3-venv
+   ```
+
+2. **Clone and run installer:**
+   ```bash
+   git clone https://github.com/smoki99/ultimatevocalremovergui_linux_roformer_5090.git
+   cd ultimatevocalremovergui_linux_roformer_5090
+   ./install.sh
+   ```
+
+3. **Run UVR:**
+   ```bash
+   source venv/bin/activate
+   python UVR.py
+   ```
+
+### Manual Installation
 
 1. **Install system dependencies:**
    ```bash
@@ -49,18 +70,36 @@ Based on [Anjok07/ultimatevocalremovergui v5.6.0](https://github.com/Anjok07/ult
 
 4. **Install PyTorch with CUDA 12.8 support:**
    ```bash
-   pip install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
    ```
 
-5. **Install remaining dependencies:**
+5. **Install dependencies:**
+   
+   For **reproducible environment** (exact tested versions):
+   ```bash
+   pip install -r requirements-lock.txt
+   ```
+   
+   For **flexible versions** (recommended for general use):
    ```bash
    pip install -r requirements.txt
    ```
 
-6. **Run UVR:**
+6. **Verify CUDA installation:**
+   ```bash
+   python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+   ```
+
+7. **Run UVR:**
    ```bash
    python UVR.py
    ```
+
+### Requirements Files
+
+- **`requirements.txt`** - Flexible version ranges for broad compatibility
+- **`requirements-lock.txt`** - Exact tested versions for reproducible builds (Python 3.12.3, RTX 5090 Ti, CUDA 12.8)
+- **`requirements-dev.txt`** - Development dependencies (testing, linting, docs)
 
 ### Model Downloads
 
