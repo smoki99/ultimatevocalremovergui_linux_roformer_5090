@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
+import sys
 from demucs.apply import apply_model, demucs_segments
 from demucs.hdemucs import HDemucs
 from demucs.model_v2 import auto_load_demucs_model_v2
@@ -41,8 +42,12 @@ import gc
 if TYPE_CHECKING:
     from UVR import ModelData
 
-if not is_macos:
-    import torch_directml # type:ignore
+# DirectML is Windows-only
+if not is_macos and sys.platform == "win32":
+    try:
+        import torch_directml # type:ignore
+    except ImportError:
+        pass  # DirectML not available on this platform
 
 mps_available = torch.backends.mps.is_available() if is_macos else False
 cuda_available = torch.cuda.is_available()
@@ -51,11 +56,13 @@ default_sr = 44100
 def get_gpu_info():
     directml_device, directml_available = DIRECTML_DEVICE, False
     
-    if not is_macos:
-        directml_available = torch_directml.is_available()
-
-        if directml_available:
-            directml_device = str(torch_directml.device()).partition(":")[0]
+    if not is_macos and sys.platform == "win32":
+        try:
+            directml_available = torch_directml.is_available() # type: ignore
+            if directml_available:
+                directml_device = str(torch_directml.device()).partition(":")[0] # type: ignore
+        except (ImportError, NameError):
+            pass  # DirectML not available
 
     return directml_device, directml_available
 
@@ -198,7 +205,10 @@ class SeperateAttributes:
                     device_prefix = DIRECTML_DEVICE if self.is_use_directml and directml_available else CUDA_DEVICE
 
                 if directml_available and self.is_use_directml:
-                    self.device = torch_directml.device() if not device_prefix else f'{device_prefix}:{self.device_set}'
+                    try:
+                        self.device = torch_directml.device() if not device_prefix else f'{device_prefix}:{self.device_set}' # type: ignore
+                    except NameError:
+                        self.device = 'cpu'  # Fallback if DirectML not available
                     self.is_other_gpu = True
                     self.is_using_directml = True
                 elif cuda_available and not self.is_use_directml:

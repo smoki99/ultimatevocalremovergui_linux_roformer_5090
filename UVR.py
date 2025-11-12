@@ -50,7 +50,12 @@ from separate import (
     save_format, clear_gpu_cache,  # Utility functions
     cuda_available, directml_available, mps_available
 )
-from playsound import playsound
+# Playsound is incompatible with Python 3.12, using dummy function
+try:
+    from playsound import playsound
+except (ImportError, OSError):
+    def playsound(sound):
+        pass  # Dummy function - sound notifications disabled
 from typing import List
 import onnx
 import re
@@ -62,8 +67,12 @@ from os.path import expanduser
 # import faulthandler
 # faulthandler.enable()
 
-if not is_macos:
-    import torch_directml # type:ignore
+# DirectML is Windows-only
+if not is_macos and sys.platform == "win32":
+    try:
+        import torch_directml # type:ignore
+    except ImportError:
+        pass  # DirectML not available on Linux
 
 is_choose_arch = cuda_available and directml_available
 is_directml_only = not cuda_available and directml_available
@@ -3548,8 +3557,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 print(self.cuda_device_list)
             
             if directml_available:
-                self.directml_list = [f"{torch_directml.device_name(i)}:{i}" for i in range(torch_directml.device_count())]
-                self.directml_list.insert(0, DEFAULT)
+                try:
+                    self.directml_list = [f"{torch_directml.device_name(i)}:{i}" for i in range(torch_directml.device_count())] # type: ignore
+                    self.directml_list.insert(0, DEFAULT)
+                except NameError:
+                    self.directml_list = [DEFAULT]  # DirectML not available
         except Exception as e:
             print(e)
             

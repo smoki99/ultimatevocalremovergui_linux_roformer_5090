@@ -659,7 +659,7 @@ DEFAULT_DATA = {
         'time_stretch_rate': 2.0,
         'pitch_rate': 2.0,
         'is_time_correction': True,
-        'is_gpu_conversion': False,
+        'is_gpu_conversion': True,  # Changed to True for better performance on CUDA systems
         'is_primary_stem_only': False,
         'is_secondary_stem_only': False,
         'is_testing_audio': False,#

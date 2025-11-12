@@ -1,5 +1,6 @@
 import torch
 import librosa
+import sys
 import lib_v5.apollo_model_data as models
 from tqdm.auto import tqdm
 import numpy as np
@@ -11,8 +12,12 @@ from separate import (get_gpu_info, clear_gpu_cache,
 import warnings
 warnings.filterwarnings("ignore")
 
-if not is_macos:
-    import torch_directml # type:ignore
+# DirectML is Windows-only
+if not is_macos and sys.platform == "win32":
+    try:
+        import torch_directml # type:ignore
+    except ImportError:
+        pass  # DirectML not available
 
 DIRECTML_DEVICE, directml_available = get_gpu_info()
 is_choose_arch = cuda_available and directml_available
@@ -55,7 +60,10 @@ def check_gpu_availability(is_gpu_conversion, device_set, is_use_directml):
                 device_prefix = DIRECTML_DEVICE if is_use_directml and directml_available else CUDA_DEVICE
 
             if directml_available and is_use_directml:
-                device = torch_directml.device() if not device_prefix else f'{device_prefix}:{device_set}'
+                try:
+                    device = torch_directml.device() if not device_prefix else f'{device_prefix}:{device_set}' # type: ignore
+                except NameError:
+                    device = 'cpu'  # Fallback if DirectML not available
                 is_other_gpu = True
                 #is_using_directml = True
             elif cuda_available and not is_use_directml:
